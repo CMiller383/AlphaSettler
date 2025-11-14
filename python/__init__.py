@@ -14,6 +14,10 @@ from .catan_engine import (
     AlphaZeroMCTS,
     AlphaZeroConfig,
     NNEvaluation,
+    StateEncoder,
+    BatchedEvaluator,
+    BatchedEvaluatorConfig,
+    make_batched_nn_evaluator,
     generate_legal_actions,
     apply_action,
 )
@@ -32,6 +36,10 @@ __all__ = [
     "AlphaZeroMCTS",
     "AlphaZeroConfig",
     "NNEvaluation",
+    "StateEncoder",
+    "BatchedEvaluator",
+    "BatchedEvaluatorConfig",
+    "make_batched_nn_evaluator",
     "generate_legal_actions",
     "apply_action",
 ]

@@ -27,6 +27,7 @@ ext_modules = [
             'src/game_state.cpp',
             'src/move_gen.cpp',
             'src/state_transition.cpp',
+            'src/state_encoder.cpp',
             'src/mcts/mcts_search.cpp',
             'src/mcts/mcts_agent.cpp',
             'src/mcts/alphazero_mcts.cpp',
@@ -108,6 +109,34 @@ class BuildExt(build_ext):
             ext.extra_compile_args = opts
             ext.extra_link_args = link_opts
         build_ext.build_extensions(self)
+    
+    def run(self):
+        """Override run to copy .pyd file to python/ directory after building."""
+        import shutil
+        import os
+        
+        build_ext.run(self)
+        
+        # Copy the built extension to python/ directory
+        if self.inplace:
+            # Find the built .pyd/.so file
+            for ext in self.extensions:
+                fullname = self.get_ext_fullname(ext.name)
+                filename = self.get_ext_filename(fullname)
+                src = os.path.join(self.build_lib, filename)
+                
+                # Determine destination - use simple name for easier imports
+                dest_dir = 'python'
+                os.makedirs(dest_dir, exist_ok=True)
+                # Extract extension (.pyd or .so) and use module name
+                _, ext_suffix = os.path.splitext(filename)
+                dest = os.path.join(dest_dir, f'{ext.name}{ext_suffix}')
+                
+                if os.path.exists(src):
+                    print(f'Copying {src} -> {dest}')
+                    shutil.copy2(src, dest)
+                else:
+                    print(f'Warning: {src} not found, skipping copy')
 
 
 setup(

@@ -5,12 +5,14 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
+#include <cstring>
 
 #include "game_state.h"
 #include "player_state.h"
 #include "action.h"
 #include "move_gen.h"
 #include "state_transition.h"
+#include "state_encoder.h"
 #include "mcts/mcts_agent.h"
 #include "mcts/alphazero_mcts.h"
 
@@ -427,5 +429,31 @@ PYBIND11_MODULE(catan_engine, m) {
         py::arg("action"),
         py::arg("rng_seed"),
         "Apply action to game state (mutates state in-place)");
+    
+    // ========================================================================
+    // State Encoder
+    // ========================================================================
+    
+    py::class_<StateEncoder>(m, "StateEncoder")
+        .def(py::init<>(),
+            "Create state encoder")
+        .def("encode_state",
+            [](const StateEncoder& encoder, const GameState& state, std::uint8_t perspective_player) {
+                // Encode to std::vector<float>
+                std::vector<float> features = encoder.encode_state(state, perspective_player);
+                
+                // Convert to numpy array (zero-copy view)
+                return py::array_t<float>(
+                    {static_cast<py::ssize_t>(features.size())},  // shape
+                    {sizeof(float)},  // strides
+                    features.data(),  // data pointer
+                    py::cast(features)  // keep vector alive
+                );
+            },
+            py::arg("state"),
+            py::arg("perspective_player"),
+            "Encode game state to feature vector from perspective player's view")
+        .def_static("get_feature_size", &StateEncoder::get_feature_size,
+            "Get total number of features in encoded state");
 }
 

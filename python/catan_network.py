@@ -150,7 +150,12 @@ class CatanNetwork(nn.Module):
             legal_probs = policy_probs[0, valid_indices].cpu().numpy()
             
             # Renormalize to sum to 1 (in case of numerical issues)
-            legal_probs = legal_probs / legal_probs.sum()
+            prob_sum = legal_probs.sum()
+            if prob_sum > 0:
+                legal_probs = legal_probs / prob_sum
+            else:
+                # All probabilities are zero - use uniform distribution
+                legal_probs = np.ones_like(legal_probs) / len(legal_probs)
 
             return legal_probs, value.item()
 

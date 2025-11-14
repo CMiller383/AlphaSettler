@@ -11,6 +11,7 @@ add_library(catan_core
     src/game_state.cpp
     src/move_gen.cpp
     src/state_transition.cpp
+    src/state_encoder.cpp
 )
 
 target_include_directories(catan_core PUBLIC
