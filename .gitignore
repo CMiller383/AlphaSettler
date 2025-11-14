@@ -1,0 +1,57 @@
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# C++ build artifacts
+*.obj
+*.o
+*.ilk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Test outputs
+topology_output.txt
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# GitHub (if needed)
+.github/

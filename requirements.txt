@@ -1,0 +1,11 @@
+pybind11>=2.6.0
+numpy>=1.19.0
+tqdm>=4.62.0
+torch>=2.0.0
+
+# Optional for visualization/analysis
+matplotlib>=3.3.0
+tensorboard>=2.8.0
+
+# Development
+pytest>=6.2.0
