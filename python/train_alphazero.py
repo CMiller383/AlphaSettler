@@ -35,14 +35,14 @@ from parallel_selfplay import ParallelSelfPlayEngine
 
 # Uncomment ONE of the following configurations:
 
-TRAINING_CONFIG = QuickTestConfig()      # 15 games - quick test (5-10 min)
+# TRAINING_CONFIG = QuickTestConfig()      # 15 games - quick test (5-10 min)
 # TRAINING_CONFIG = SmallTrainingConfig()   # 500 games - initial training (~2-4 hours)
 # TRAINING_CONFIG = MediumTrainingConfig()  # 10k games - serious training (~10-20 hours)
 # TRAINING_CONFIG = LargeTrainingConfig()   # 100k games - full training (~100+ hours CPU)
 
 # For PACE GPU Cluster:
 # TRAINING_CONFIG = PACEGPUConfig()        # A100 optimized (100k games, ~40-80 hours)
-# TRAINING_CONFIG = H100Config()           # H100 optimized (100k games, ~30-60 hours)
+TRAINING_CONFIG = H100Config()           # H100 optimized (100k games, ~30-60 hours)
 # TRAINING_CONFIG = H200Config()           # H200 optimized (100k games, ~20-40 hours)
 
 # ============================================================================
@@ -546,7 +546,8 @@ def main():
     
     # Create run directory with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join('training_runs', timestamp)
+    base_run_dir = os.environ.get('ALPHASETTLER_RUN_DIR', 'training_runs')
+    run_dir = os.path.join(base_run_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
     
     # Create checkpoint subdirectory
