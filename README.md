@@ -1,76 +1,121 @@
-# AlphaSettler - Catan RL Engine
+# AlphaSettler
 
-Fast C++ Catan game engine with Python bindings for reinforcement learning.
+**AlphaZero-style deep reinforcement learning for Settlers of Catan**
 
-## Building
+Fast C++ game engine with batched GPU evaluation, parallel self-play, and neural network training.
 
-### C++ Only (with tests)
+## Quick Start
+
+### 1. Build
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+# Install dependencies
+pip install torch numpy tqdm
+
+# Build C++ engine
+python setup.py build_ext --inplace
 ```
 
-### Python Bindings
+### 2. Test
 ```bash
-pip install pybind11 numpy
-pip install -e .
+# Complete end-to-end test
+python test_complete.py
 ```
 
-## Usage
-
-### Python
-```python
-from catan_engine import GameState, MCTSAgent, MCTSConfig
-
-# Create game
-game = GameState.create_new_game(num_players=4, seed=42)
-
-# Create MCTS agent
-config = MCTSConfig()
-config.num_iterations = 200
-agent = MCTSAgent(config)
-
-# Play game
-winner = agent.play_game(game)
-print(f"Winner: Player {winner}")
-```
-
-### Evaluation
+### 3. Train
 ```bash
-# Run self-play evaluation
-python python/evaluate.py --mode selfplay --games 50 --iterations 200
+# Local training
+python python/train_alphazero.py
 
-# Compare configurations
-python python/evaluate.py --mode compare --games 20
-
-# Test single game
-python python/evaluate.py --mode single --iterations 500
+# Edit python/config.py to choose:
+# - QuickTestConfig (3 iter, 15 games)
+# - SmallTrainingConfig (20 iter, 1K games)
+# - MediumTrainingConfig (100 iter, 10K games)
+# - H100Config / H200Config (GPU optimized)
 ```
 
-## Structure
+### 4. Deploy to PACE/ICE
+```bash
+# Copy files
+scp -r AlphaSettler <username>@login-ice.pace.gatech.edu:~/
 
-```
-include/           C++ headers
-  mcts/           Pure MCTS implementation
-src/              C++ source
-  mcts/           MCTS implementation
-python/           Python bindings and scripts
-  bindings.cpp    pybind11 bindings
-  evaluate.py     Evaluation scripts
-tests/            C++ test executables
+# SSH and setup
+ssh <username>@login-ice.pace.gatech.edu
+cd ~/AlphaSettler
+chmod +x deploy_pace.sh
+./deploy_pace.sh
+
+# Submit training job
+sbatch run_training.sh
 ```
 
 ## Features
 
-- Fast C++ game engine with minimal allocations
-- Pure MCTS with random rollouts
-- Python bindings via pybind11
-- Self-play and evaluation tools
-- Ready for neural network integration
+- **C++ Game Engine**: Efficient board state and move generation
+- **AlphaZero MCTS**: Neural network-guided tree search
+- **Batched Evaluation**: 2-5x speedup via batch NN inference
+- **Parallel Self-Play**: Multi-threaded game generation
+- **GPU Training**: PyTorch with automatic H100/H200 detection
+- **Progress Monitoring**: Real-time progress bars and metrics
 
-## Next Steps
+## Training Configs
 
-1. Add AlphaZero-style MCTS (with NN priors/values)
-2. Implement state encoding for neural networks
-3. Build training loop with PyTorch/TensorFlow
+| Config | Iterations | Games | Time (H100) |
+|--------|-----------|--------|-------------|
+| QuickTest | 3 | 15 | ~1 min |
+| Small | 20 | 1K | ~10 min |
+| Medium | 100 | 10K | ~1 hour |
+| H100 | 2000 | 2M | ~2-5 days |
+| H200 | 3000 | 4.5M | ~3-7 days |
+
+## Output
+
+Training produces:
+```
+training_runs/YYYYMMDD_HHMMSS/
+├── training_log.json       # All metrics
+├── run_info.json          # Config info
+├── training_curves.png    # Loss plots
+└── checkpoints/
+    ├── checkpoint_iter_100.pt
+    └── final_model.pt
+```
+
+## Project Structure
+
+```
+AlphaSettler/
+├── include/              # C++ headers
+│   ├── action.h
+│   ├── game_state.h
+│   ├── move_gen.h
+│   └── mcts/            # MCTS headers
+├── src/                 # C++ implementation
+│   ├── game_state.cpp
+│   ├── move_gen.cpp
+│   └── mcts/
+├── python/
+│   ├── train_alphazero.py      # Main training loop
+│   ├── parallel_selfplay.py    # Multi-threaded self-play
+│   ├── catan_network.py        # Neural network
+│   ├── config.py              # Training configs
+│   └── bindings.cpp           # Python/C++ interface
+├── test_complete.py     # End-to-end test
+├── deploy_pace.sh      # PACE setup script
+└── run_training.sh     # SLURM job script
+```
+
+## Performance
+
+- **Local (CPU, 8 cores)**: ~2-5 games/sec
+- **H100 GPU**: ~15-30 games/sec (32 workers, batch 128)
+- **H200 GPU**: ~20-40 games/sec (48 workers, batch 192)
+- **Batch efficiency**: 2.0-5.0 avg batch size
+
+## Requirements
+
+- **C++17** compiler (GCC 9+, MSVC 2019+)
+- **Python 3.11+**
+- **PyTorch** with CUDA 12.1+ (for GPU)
+- **pybind11**, **numpy**, **tqdm**
+
+

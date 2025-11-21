@@ -4,6 +4,7 @@
 #include "mcts/alphazero_mcts.h"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 namespace catan {
 namespace alphazero {
@@ -122,8 +123,8 @@ void AlphaZeroMCTS::expand_and_evaluate(AlphaZeroNode* node, GameState& state) {
         return;
     }
     
-    // Already expanded - evaluate and update
-    if (!node->legal_actions.empty()) {
+    // Already expanded (has children) - just evaluate
+    if (!node->children.empty()) {
         NNEvaluation eval = evaluator_(state);
         float value = eval.value;
         
@@ -141,7 +142,10 @@ void AlphaZeroMCTS::expand_and_evaluate(AlphaZeroNode* node, GameState& state) {
     }
     
     // First visit - expand this node
-    generate_legal_actions(state, node->legal_actions);
+    // Generate legal actions if not already done
+    if (node->legal_actions.empty()) {
+        generate_legal_actions(state, node->legal_actions);
+    }
     
     if (node->legal_actions.empty()) {
         node->visit_count = 1;

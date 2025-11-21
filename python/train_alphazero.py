@@ -10,15 +10,42 @@ import numpy as np
 from collections import deque
 import pickle
 import os
+import json
+import time
+from datetime import datetime
 from tqdm import tqdm
 
 from catan_engine import (
     GameState, AlphaZeroMCTS, AlphaZeroConfig, NNEvaluation,
-    generate_legal_actions, apply_action
+    generate_legal_actions, apply_action, BatchedEvaluatorConfig
 )
 from state_encoder import StateEncoder
 from catan_network import CatanNetwork
-from config import TrainingConfig, SmallTrainingConfig, QuickTestConfig
+from config import (
+    TrainingConfig, QuickTestConfig, SmallTrainingConfig, 
+    MediumTrainingConfig, LargeTrainingConfig, 
+    PACEGPUConfig, H100Config, H200Config
+)
+from parallel_selfplay import ParallelSelfPlayEngine
+
+
+# ============================================================================
+# TRAINING CONFIGURATION - CHANGE THIS TO SELECT DIFFERENT CONFIGS
+# ============================================================================
+
+# Uncomment ONE of the following configurations:
+
+TRAINING_CONFIG = QuickTestConfig()      # 15 games - quick test (5-10 min)
+# TRAINING_CONFIG = SmallTrainingConfig()   # 500 games - initial training (~2-4 hours)
+# TRAINING_CONFIG = MediumTrainingConfig()  # 10k games - serious training (~10-20 hours)
+# TRAINING_CONFIG = LargeTrainingConfig()   # 100k games - full training (~100+ hours CPU)
+
+# For PACE GPU Cluster:
+# TRAINING_CONFIG = PACEGPUConfig()        # A100 optimized (100k games, ~40-80 hours)
+# TRAINING_CONFIG = H100Config()           # H100 optimized (100k games, ~30-60 hours)
+# TRAINING_CONFIG = H200Config()           # H200 optimized (100k games, ~20-40 hours)
+
+# ============================================================================
 
 
 class AlphaZeroTrainer:
@@ -62,6 +89,19 @@ class AlphaZeroTrainer:
         # Statistics
         self.training_step = 0
         self.self_play_games = 0
+        
+        # Training history for logging
+        self.training_history = {
+            'iterations': [],
+            'policy_losses': [],
+            'value_losses': [],
+            'total_losses': [],
+            'games_played': [],
+            'replay_buffer_size': [],
+            'timestamps': [],
+            'self_play_times': [],
+            'training_times': []
+        }
         
     def nn_evaluator(self, state: GameState):
         """
@@ -165,19 +205,94 @@ class AlphaZeroTrainer:
         return training_examples
     
     def generate_self_play_data(self, num_games):
-        """Generate self-play games and collect training data."""
-        print(f"Generating {num_games} self-play games...")
+        """Generate self-play games using parallel batched evaluation."""
+        print(f"Generating {num_games} self-play games with parallel batched evaluation...")
         
+        # MCTS config
         mcts_config = AlphaZeroConfig()
         mcts_config.num_simulations = self.config.mcts_simulations
         mcts_config.cpuct = self.config.cpuct
         mcts_config.dirichlet_alpha = self.config.dirichlet_alpha
         mcts_config.dirichlet_weight = self.config.dirichlet_weight
+        mcts_config.add_exploration_noise = True
         
-        for game_idx in tqdm(range(num_games)):
-            examples = self.self_play_game(mcts_config)
-            self.replay_buffer.extend(examples)
+        # Batched evaluator config
+        batch_config = BatchedEvaluatorConfig()
+        batch_config.max_batch_size = self.config.max_batch_size
+        batch_config.min_batch_size = 1
+        batch_config.timeout_ms = 5  # Short timeout for responsiveness
+        batch_config.enable_batching = True
+        
+        # Determine number of workers (parallel games)
+        if self.config.selfplay_workers is not None:
+            num_workers = min(num_games, self.config.selfplay_workers)
+        else:
+            # Auto-detect: use 2x CPU cores since MCTS threads wait on NN
+            import multiprocessing
+            num_workers = min(num_games, multiprocessing.cpu_count() * 2, 16)
+        
+        # Create parallel self-play engine
+        engine = ParallelSelfPlayEngine(
+            network=self.network,
+            config=mcts_config,
+            batch_config=batch_config,
+            num_workers=num_workers,
+            device=self.config.device
+        )
+        
+        # Run parallel self-play
+        results = engine.play_games(
+            num_games=num_games,
+            num_players=self.config.num_players,
+            seed_offset=self.self_play_games
+        )
+        
+        # Convert results to training examples
+        total_examples = 0
+        for game_result in results:
+            # Convert each game to training examples
+            states = game_result['states']
+            policies = game_result['policies']
+            winner = game_result['winner']
+            
+            for i, (state, policy) in enumerate(zip(states, policies)):
+                player = state.current_player
+                
+                # Encode state
+                features = self.encoder.encode_state(state, player)
+                
+                # Get legal actions for this state
+                legal_actions = generate_legal_actions(state)
+                num_legal = len(legal_actions)
+                
+                # Policy is already in correct format from MCTS
+                policy_arr = np.array(policy[:num_legal], dtype=np.float32)
+                legal_indices = np.arange(num_legal, dtype=np.int32)
+                
+                # Determine value based on outcome
+                if winner is not None:
+                    value = 1.0 if player == winner else 0.0
+                else:
+                    # Game didn't finish - use VP as proxy
+                    value = state.players[player].total_victory_points() / 10.0
+                
+                # Add to replay buffer
+                self.replay_buffer.append({
+                    'state': features,
+                    'policy': policy_arr,
+                    'legal_indices': legal_indices,
+                    'player': player,
+                    'value': value
+                })
+                total_examples += 1
+            
             self.self_play_games += 1
+        
+        # Print statistics
+        print(f"  Parallel workers: {num_workers}")
+        print(f"  Total games: {len(results)}")
+        print(f"  Avg turns/game: {sum(r['turns'] for r in results) / len(results):.1f}")
+        print(f"  Training examples: {total_examples}")
     
     def train_step(self, batch_size):
         """
@@ -217,11 +332,10 @@ class AlphaZeroTrainer:
         policy_logits, values = self.network(states)
         
         # Compute losses
-        policy_loss = F.cross_entropy(
-            policy_logits, 
-            policy_targets,
-            reduction='mean'
-        )
+        # Policy loss: KL divergence between MCTS policy and network policy
+        # Cross-entropy with soft targets (MCTS visit distribution)
+        log_probs = F.log_softmax(policy_logits, dim=1)
+        policy_loss = -(policy_targets * log_probs).sum(dim=1).mean()
         
         value_loss = F.mse_loss(values, value_targets)
         
@@ -243,7 +357,7 @@ class AlphaZeroTrainer:
     
     def train_on_buffer(self, num_epochs, batch_size):
         """Train network on current replay buffer."""
-        print(f"Training for {num_epochs} epochs...")
+        all_losses = []
         
         for epoch in range(num_epochs):
             losses = []
@@ -251,16 +365,40 @@ class AlphaZeroTrainer:
             # Multiple passes through data
             num_batches = max(1, len(self.replay_buffer) // batch_size)
             
-            for _ in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{num_epochs}"):
+            # Progress bar for batches
+            batch_pbar = tqdm(range(num_batches), 
+                            desc=f"    Epoch {epoch+1}/{num_epochs}", 
+                            leave=False, 
+                            ncols=100, 
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+            
+            for _ in batch_pbar:
                 loss_dict = self.train_step(batch_size)
                 losses.append(loss_dict)
+                # Update progress bar with current losses
+                batch_pbar.set_postfix({'p_loss': f'{loss_dict["policy_loss"]:.3f}', 
+                                       'v_loss': f'{loss_dict["value_loss"]:.3f}'})
             
-            # Print average losses
-            avg_policy_loss = np.mean([l['policy_loss'] for l in losses])
-            avg_value_loss = np.mean([l['value_loss'] for l in losses])
-            avg_total_loss = np.mean([l['total_loss'] for l in losses])
-            
-            print(f"Epoch {epoch+1}: Policy={avg_policy_loss:.4f}, Value={avg_value_loss:.4f}, Total={avg_total_loss:.4f}")
+            all_losses.extend(losses)
+        
+        # Return average losses across all epochs
+        return {
+            'policy_loss': np.mean([l['policy_loss'] for l in all_losses]),
+            'value_loss': np.mean([l['value_loss'] for l in all_losses]),
+            'total_loss': np.mean([l['total_loss'] for l in all_losses])
+        }
+    
+    def log_iteration(self, iteration, losses, self_play_time, training_time):
+        """Log iteration metrics to history."""
+        self.training_history['iterations'].append(iteration)
+        self.training_history['policy_losses'].append(losses['policy_loss'])
+        self.training_history['value_losses'].append(losses['value_loss'])
+        self.training_history['total_losses'].append(losses['total_loss'])
+        self.training_history['games_played'].append(self.self_play_games)
+        self.training_history['replay_buffer_size'].append(len(self.replay_buffer))
+        self.training_history['timestamps'].append(datetime.now().isoformat())
+        self.training_history['self_play_times'].append(self_play_time)
+        self.training_history['training_times'].append(training_time)
     
     def save_checkpoint(self, path):
         """Save model checkpoint."""
@@ -269,7 +407,8 @@ class AlphaZeroTrainer:
             'optimizer_state': self.optimizer.state_dict(),
             'training_step': self.training_step,
             'self_play_games': self.self_play_games,
-            'replay_buffer': list(self.replay_buffer)
+            'replay_buffer': list(self.replay_buffer),
+            'training_history': self.training_history
         }
         torch.save(checkpoint, path)
         print(f"Saved checkpoint to {path}")
@@ -283,42 +422,223 @@ class AlphaZeroTrainer:
         self.self_play_games = checkpoint['self_play_games']
         if 'replay_buffer' in checkpoint:
             self.replay_buffer = deque(checkpoint['replay_buffer'], maxlen=self.config.replay_buffer_size)
+        if 'training_history' in checkpoint:
+            self.training_history = checkpoint['training_history']
         print(f"Loaded checkpoint from {path}")
+    
+    def save_training_log(self, run_dir):
+        """Save training history to JSON (fast, machine-readable)."""
+        log_path = os.path.join(run_dir, 'training_log.json')
+        with open(log_path, 'w') as f:
+            json.dump(self.training_history, f)
+    
+    def save_run_info(self, run_dir, start_time, end_time):
+        """Save run metadata and config."""
+        info = {
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration_seconds': (end_time - start_time),
+            'config': {
+                'num_players': self.config.num_players,
+                'mcts_simulations': self.config.mcts_simulations,
+                'cpuct': self.config.cpuct,
+                'hidden_size': self.config.hidden_size,
+                'num_residual_blocks': self.config.num_residual_blocks,
+                'batch_size': self.config.batch_size,
+                'learning_rate': self.config.learning_rate,
+                'games_per_iteration': self.config.games_per_iteration,
+                'num_iterations': self.config.num_iterations,
+                'total_games': self.self_play_games,
+                'device': str(self.config.device)
+            },
+            'final_stats': {
+                'total_training_steps': self.training_step,
+                'replay_buffer_size': len(self.replay_buffer),
+                'final_policy_loss': self.training_history['policy_losses'][-1] if self.training_history['policy_losses'] else None,
+                'final_value_loss': self.training_history['value_losses'][-1] if self.training_history['value_losses'] else None
+            }
+        }
+        
+        info_path = os.path.join(run_dir, 'run_info.json')
+        with open(info_path, 'w') as f:
+            json.dump(info, f, indent=2)
+    
+    def plot_training_curves(self, run_dir):
+        """Generate training curve plots."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+            
+            if not self.training_history['iterations']:
+                return
+            
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            
+            # Loss curves
+            axes[0, 0].plot(self.training_history['iterations'], self.training_history['policy_losses'], label='Policy Loss')
+            axes[0, 0].set_xlabel('Iteration')
+            axes[0, 0].set_ylabel('Loss')
+            axes[0, 0].set_title('Policy Loss Over Time')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            axes[0, 1].plot(self.training_history['iterations'], self.training_history['value_losses'], label='Value Loss', color='orange')
+            axes[0, 1].set_xlabel('Iteration')
+            axes[0, 1].set_ylabel('Loss')
+            axes[0, 1].set_title('Value Loss Over Time')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Games played
+            axes[1, 0].plot(self.training_history['iterations'], self.training_history['games_played'], label='Total Games', color='green')
+            axes[1, 0].set_xlabel('Iteration')
+            axes[1, 0].set_ylabel('Games')
+            axes[1, 0].set_title('Games Played Over Time')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Time per iteration
+            total_times = [s + t for s, t in zip(self.training_history['self_play_times'], self.training_history['training_times'])]
+            axes[1, 1].plot(self.training_history['iterations'], total_times, label='Time/Iter', color='red')
+            axes[1, 1].set_xlabel('Iteration')
+            axes[1, 1].set_ylabel('Time (seconds)')
+            axes[1, 1].set_title('Time per Iteration')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plot_path = os.path.join(run_dir, 'training_curves.png')
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+            print(f"Saved training plots to {plot_path}")
+        except ImportError:
+            print("matplotlib not available, skipping plots")
+        except Exception as e:
+            print(f"Error generating plots: {e}")
 
 
 def main():
     """Example training run."""
-    # Choose configuration preset
-    # config = QuickTestConfig()     # ~15 games for quick testing
-    config = SmallTrainingConfig()   # ~1000 games for initial trainin/g
-    # config = MediumTrainingConfig()  # ~10k games for longer experiments
-    # config = LargeTrainingConfig()   # ~100k games for full training
+    # Allow config selection via environment variable
+    config_name = os.environ.get('ALPHASETTLER_CONFIG', 'TRAINING_CONFIG')
+    
+    # Map config names to actual config objects
+    config_map = {
+        'QuickTestConfig': QuickTestConfig(),
+        'SmallTrainingConfig': SmallTrainingConfig(),
+        'MediumTrainingConfig': MediumTrainingConfig(),
+        'LargeTrainingConfig': LargeTrainingConfig(),
+        'PACEGPUConfig': PACEGPUConfig(),
+        'H100Config': H100Config(),
+        'H200Config': H200Config(),
+        'TRAINING_CONFIG': TRAINING_CONFIG  # Default from top of file
+    }
+    
+    # Select config
+    if config_name in config_map:
+        config = config_map[config_name]
+        if config_name != 'TRAINING_CONFIG':
+            print(f"Using config from environment: {config_name}\n")
+    else:
+        print(f"Warning: Unknown config '{config_name}', using default TRAINING_CONFIG\n")
+        config = TRAINING_CONFIG
+    
+    # Create run directory with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join('training_runs', timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Create checkpoint subdirectory
+    checkpoint_dir = os.path.join(run_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    config.checkpoint_dir = checkpoint_dir
     
     # Print configuration
     config.summary()
-    
-    # Create checkpoint directory
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    print(f"\nRun directory: {run_dir}")
+    print(f"All outputs will be saved to this directory.\n")
     
     # Initialize trainer
     trainer = AlphaZeroTrainer(config)
     
+    # Track overall timing
+    run_start_time = time.time()
+    
+    # Print training header
+    print(f"\n{'='*90}")
+    print(f"{'  AlphaSettler Training':^90}")
+    print(f"{'='*90}")
+    print(f"  {config.num_iterations} iterations × {config.games_per_iteration} games = {config.num_iterations * config.games_per_iteration} total games")
+    print(f"  Device: {config.device}")
+    print(f"  Workers: {config.selfplay_workers if config.selfplay_workers else 'auto'}")
+    print(f"  Batch size: {config.max_batch_size}")
+    print(f"{'='*90}\n")
+    
     # Training loop
     for iteration in range(config.num_iterations):
-        print(f"\n=== Iteration {iteration + 1}/{config.num_iterations} ===")
+        iter_start = time.time()
+        print(f"\n{'─'*90}")
+        print(f"  Iteration {iteration + 1}/{config.num_iterations}")
+        print(f"{'─'*90}")
         
         # Self-play
+        print(f"\n[1/3] Self-play: Generating {config.games_per_iteration} games...")
+        sp_start = time.time()
         trainer.generate_self_play_data(config.games_per_iteration)
+        sp_time = time.time() - sp_start
+        print(f"✓ Self-play completed in {sp_time:.1f}s")
         
         # Train
-        trainer.train_on_buffer(config.training_epochs_per_iteration, config.batch_size)
+        print(f"\n[2/3] Training: Processing {len(trainer.replay_buffer)} examples for {config.training_epochs_per_iteration} epochs...")
+        train_start = time.time()
+        losses = trainer.train_on_buffer(config.training_epochs_per_iteration, config.batch_size)
+        train_time = time.time() - train_start
+        print(f"✓ Training completed in {train_time:.1f}s")
+        
+        # Log iteration (fast, in-memory)
+        trainer.log_iteration(iteration + 1, losses, sp_time, train_time)
+        
+        # Print summary
+        iter_time = time.time() - iter_start
+        print(f"\n{'─'*90}")
+        print(f"  ✓ Iteration {iteration+1} Complete")
+        print(f"  │ Policy Loss: {losses['policy_loss']:.4f}  │  Value Loss: {losses['value_loss']:.4f}")
+        print(f"  │ Time: {iter_time:.1f}s (Self-play: {sp_time:.1f}s | Training: {train_time:.1f}s)")
+        print(f"  │ Replay Buffer: {len(trainer.replay_buffer):,} examples  │  Total Games: {trainer.self_play_games:,}")
+        print(f"{'─'*90}")
         
         # Save checkpoint
         if (iteration + 1) % config.checkpoint_interval == 0:
-            checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_iter_{iteration+1}.pt')
+            print(f"\n[3/3] Saving checkpoint...")
+            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_iter_{iteration+1}.pt')
             trainer.save_checkpoint(checkpoint_path)
+            
+            # Save training log (lightweight JSON write)
+            trainer.save_training_log(run_dir)
+            print(f"✓ Checkpoint saved")
     
-    print("\nTraining complete!")
+    run_end_time = time.time()
+    
+    print("\n" + "="*70)
+    print("Training complete!")
+    print(f"Total time: {(run_end_time - run_start_time) / 3600:.2f} hours")
+    print(f"Total games: {trainer.self_play_games}")
+    print("="*70)
+    
+    # Save final outputs
+    print("\nSaving final outputs...")
+    final_checkpoint = os.path.join(checkpoint_dir, 'final_model.pt')
+    trainer.save_checkpoint(final_checkpoint)
+    trainer.save_training_log(run_dir)
+    trainer.save_run_info(run_dir, run_start_time, run_end_time)
+    trainer.plot_training_curves(run_dir)
+    
+    print(f"\nAll results saved to: {run_dir}")
+    print("  - training_log.json (all metrics)")
+    print("  - run_info.json (config and metadata)")
+    print("  - training_curves.png (loss plots)")
+    print(f"  - checkpoints/ ({config.num_iterations // config.checkpoint_interval} checkpoints)")
 
 
 if __name__ == '__main__':

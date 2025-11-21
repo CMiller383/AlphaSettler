@@ -49,6 +49,8 @@ class TrainingConfig:
         # ====================================================================
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_workers = 0  # DataLoader workers (0 for Windows compatibility)
+        self.selfplay_workers = None  # Auto-detect: min(games, cpu_count*2, 16)
+        self.max_batch_size = 64  # Max batch size for batched NN evaluation
         
         # ====================================================================
         # Checkpointing & Logging
@@ -148,3 +150,115 @@ class LargeTrainingConfig(TrainingConfig):
         self.checkpoint_interval = 20
         self.eval_interval = 20
         self.eval_games = 100
+
+
+class PACEGPUConfig(TrainingConfig):
+    """
+    Optimized configuration for PACE GPU cluster (A100/H100).
+    Large batch sizes and network to leverage GPU memory and compute.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Large network for GPU
+        self.hidden_size = 768
+        self.num_residual_blocks = 8
+        
+        # High MCTS simulations for quality
+        self.mcts_simulations = 400
+        
+        # Large batches to saturate GPU
+        self.batch_size = 512  # Increase to 1024 if using A100 80GB or H100
+        
+        # Aggressive self-play
+        self.games_per_iteration = 200
+        self.training_epochs_per_iteration = 10
+        self.num_iterations = 500  # 100k games
+        
+        # Large replay buffer
+        self.replay_buffer_size = 500000
+        
+        # More frequent checkpoints for long runs
+        self.checkpoint_interval = 10
+        self.eval_interval = 20
+        self.eval_games = 100
+        
+        # GPU performance settings
+        self.pin_memory = torch.cuda.is_available()
+        self.selfplay_workers = 24  # Generous (1.5x cores), won't crash
+        self.max_batch_size = 64  # Moderate batches on GPU
+        
+    def summary(self):
+        """Print configuration summary with GPU info."""
+        super().summary()
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            print(f"Pin Memory: {self.pin_memory}")
+            print("="*60 + "\n")
+
+
+class H100Config(PACEGPUConfig):
+    """
+    Optimized for H100 80GB HGX.
+    Higher batch sizes and larger network than A100.
+    """
+    
+    def __init__(self):
+        super().__init__()
+     #  Medium-sized network for balance
+        self.hidden_size = 512
+        self.num_residual_blocks = 4
+         
+        # Moderate MCTS for reasonable quality
+        self.mcts_simulations = 200
+        
+        # 100 games per iteration × 100 iterations = 10,000 games
+        self.games_per_iteration = 100
+        self.training_epochs_per_iteration = 5
+        self.num_iterations = 100
+        
+        # Standard batch sizes
+        self.batch_size = 256
+        self.replay_buffer_size = 100000
+        
+        # SPARSE CHECKPOINTS - only save every 25 iterations (4 checkpoints total)
+        # This avoids accumulating too many large checkpoint files
+        self.checkpoint_interval = 25
+        
+        # Reasonable evaluation
+        self.eval_interval = 20
+        self.eval_games = 50
+        
+        # GPU/performance settings
+        self.selfplay_workers = 16  # Conservative parallel games
+        self.max_batch_size = 64  # Reasonable batch size
+        
+        
+
+class H200Config(PACEGPUConfig):
+    """
+    Optimized for H200 80GB HGX (or 141GB HBM3e variant).
+    Maximum batch sizes and deepest network.
+    H200 has 4.8 TB/s memory bandwidth vs H100's 3.35 TB/s.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Maximum batch size for H200's massive bandwidth
+        self.batch_size = 1024  # Can go to 2048 with 141GB model
+        
+        # Very deep network
+        self.hidden_size = 1024
+        self.num_residual_blocks = 12
+        
+        # Maximum parallel self-play
+        self.games_per_iteration = 400
+        
+        # Training can be more aggressive
+        self.learning_rate = 0.002
+        
+        # Maximum parallelism
+        self.selfplay_workers = 48  # Very generous (3x cores) for max batching
+        self.max_batch_size = 256  # Very large NN batches
+

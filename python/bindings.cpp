@@ -13,6 +13,7 @@
 #include "move_gen.h"
 #include "state_transition.h"
 #include "state_encoder.h"
+#include "batched_evaluator.h"
 #include "mcts/mcts_agent.h"
 #include "mcts/alphazero_mcts.h"
 
@@ -455,5 +456,75 @@ PYBIND11_MODULE(catan_engine, m) {
             "Encode game state to feature vector from perspective player's view")
         .def_static("get_feature_size", &StateEncoder::get_feature_size,
             "Get total number of features in encoded state");
+    
+    // ========================================================================
+    // Batched Evaluator
+    // ========================================================================
+    
+    py::class_<BatchedEvaluatorConfig>(m, "BatchedEvaluatorConfig")
+        .def(py::init<>())
+        .def_readwrite("max_batch_size", &BatchedEvaluatorConfig::max_batch_size,
+            "Maximum batch size for NN inference")
+        .def_readwrite("min_batch_size", &BatchedEvaluatorConfig::min_batch_size,
+            "Minimum batch size (wait for this many)")
+        .def_readwrite("timeout_ms", &BatchedEvaluatorConfig::timeout_ms,
+            "Timeout for batch collection (milliseconds)")
+        .def_readwrite("enable_batching", &BatchedEvaluatorConfig::enable_batching,
+            "If false, process immediately (for debugging)");
+    
+    py::class_<BatchedEvaluator, std::shared_ptr<BatchedEvaluator>>(m, "BatchedEvaluator")
+        .def(py::init<const BatchedEvaluatorConfig&, BatchEvaluatorCallback>(),
+            py::arg("config"),
+            py::arg("callback"),
+            "Create batched evaluator with configuration and callback")
+        .def("start", &BatchedEvaluator::start,
+            "Start the batch processing thread")
+        .def("stop", &BatchedEvaluator::stop,
+            "Stop the batch processing thread")
+        .def("get_total_requests", &BatchedEvaluator::get_total_requests,
+            "Get total number of evaluation requests")
+        .def("get_total_batches", &BatchedEvaluator::get_total_batches,
+            "Get total number of processed batches")
+        .def("get_average_batch_size", &BatchedEvaluator::get_average_batch_size,
+            "Get average batch size");
+    
+    // Helper to create NNEvaluator from BatchedEvaluator
+    // Wraps with GIL release so worker thread can call back into Python
+    m.def("make_batched_nn_evaluator",
+        [](std::shared_ptr<BatchedEvaluator> evaluator) -> py::object {
+            // Create a Python-callable wrapper that releases GIL
+            return py::cpp_function(
+                [evaluator](const GameState& state) -> alphazero::NNEvaluation {
+                    // Get legal actions count
+                    std::vector<Action> legal_actions;
+                    generate_legal_actions(state, legal_actions);
+                    
+                    std::vector<float> policy;
+                    float value;
+                    
+                    // Release GIL while waiting for batched evaluation
+                    // This allows the worker thread to call back into Python
+                    {
+                        py::gil_scoped_release release;
+                        auto result = evaluator->evaluate(
+                            state,
+                            state.current_player,
+                            legal_actions.size()
+                        );
+                        policy = std::move(result.first);
+                        value = result.second;
+                    }
+                    
+                    // Return as NNEvaluation
+                    alphazero::NNEvaluation eval;
+                    eval.policy = std::move(policy);
+                    eval.value = value;
+                    return eval;
+                },
+                py::arg("state")
+            );
+        },
+        py::arg("evaluator"),
+        "Create NNEvaluator compatible with AlphaZero MCTS from BatchedEvaluator");
 }
 

@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional
 from collections import defaultdict
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from catan_engine import (
     GameState,
@@ -151,6 +152,9 @@ class ParallelSelfPlayEngine:
         results = [None] * num_games
         results_lock = threading.Lock()
         
+        # Progress bar
+        pbar = tqdm(total=num_games, desc="  Self-play", unit=" game", ncols=100, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        
         # Worker function
         def worker(worker_id: int):
             while True:
@@ -161,27 +165,37 @@ class ParallelSelfPlayEngine:
                     game_idx = len(game_seeds) - 1
                     seed = game_seeds.pop()
                 
-                # Play game
-                game_result = self._play_single_game(
-                    seed=seed,
-                    num_players=num_players,
-                    worker_id=worker_id
-                )
-                
-                # Store result
-                with results_lock:
-                    results[seed - seed_offset] = game_result
+                try:
+                    # Play game
+                    game_result = self._play_single_game(
+                        seed=seed,
+                        num_players=num_players,
+                        worker_id=worker_id
+                    )
+                    
+                    # Store result
+                    with results_lock:
+                        results[seed - seed_offset] = game_result
+                        pbar.update(1)
+                except Exception as e:
+                    # Log error but don't crash other workers
+                    with results_lock:
+                        print(f"\nWorker {worker_id} error on game {seed}: {e}")
+                        import traceback
+                        traceback.print_exc()
         
         # Start workers
         workers = []
         for worker_id in range(self.num_workers):
-            t = threading.Thread(target=worker, args=(worker_id,))
+            t = threading.Thread(target=worker, args=(worker_id,), daemon=False)
             t.start()
             workers.append(t)
         
         # Wait for completion
         for t in workers:
             t.join()
+        
+        pbar.close()
         
         # Stop batched evaluator
         self.batched_evaluator.stop()

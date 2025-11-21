@@ -28,6 +28,7 @@ ext_modules = [
             'src/move_gen.cpp',
             'src/state_transition.cpp',
             'src/state_encoder.cpp',
+            'src/batched_evaluator.cpp',
             'src/mcts/mcts_search.cpp',
             'src/mcts/mcts_agent.cpp',
             'src/mcts/alphazero_mcts.cpp',

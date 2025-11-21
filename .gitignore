@@ -1,4 +1,4 @@
-# Build directories
+Upd# Build directories
 build/
 dist/
 *.egg-info/
@@ -14,6 +14,7 @@ venv/
 env/
 ENV/
 .venv/
+.eggs/
 
 # IDE
 .vscode/
@@ -47,11 +48,28 @@ Makefile
 # Test outputs
 topology_output.txt
 
+# Training outputs
+training_runs/
+*.pt
+*.pth
+*.png
+*.jpg
+*.json
+
 # Logs
 *.log
+*.out
+*.err
+
+# NumPy data
+*.npy
+*.npz
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Pytest
+.pytest_cache/
 
 # GitHub (if needed)
 .github/
