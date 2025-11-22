@@ -81,21 +81,34 @@ class TrainingConfig:
 
 
 class QuickTestConfig(TrainingConfig):
-    """Quick test configuration for debugging (very small)."""
+    """Quick test configuration for benchmarking GPU performance."""
     
     def __init__(self):
         super().__init__()
-        self.hidden_size = 128
-        self.num_residual_blocks = 2
-        self.mcts_simulations = 25
-        self.games_per_iteration = 5
-        self.training_epochs_per_iteration = 2
-        self.num_iterations = 3
-        self.batch_size = 32
-        self.replay_buffer_size = 1000
-        self.checkpoint_interval = 1
-        self.eval_interval = 1
-        self.eval_games = 5
+        # Network size - moderate for speed testing
+        self.hidden_size = 256
+        self.num_residual_blocks = 3
+        
+        # MCTS settings
+        self.mcts_simulations = 100
+        
+        # 1000 games: 10 iterations × 100 games
+        self.games_per_iteration = 100
+        self.training_epochs_per_iteration = 3
+        self.num_iterations = 10
+        
+        # Training settings
+        self.batch_size = 128
+        self.replay_buffer_size = 50000
+        
+        # Checkpointing
+        self.checkpoint_interval = 10  # Save every 10 iterations
+        self.eval_interval = 5
+        self.eval_games = 20
+        
+        # Performance settings optimized for H100 with 16 cores
+        self.selfplay_workers = 16  # Use all 16 cores for maximum parallelism
+        self.max_batch_size = 64  # Larger batches for GPU efficiency
 
 
 class SmallTrainingConfig(TrainingConfig):
@@ -231,8 +244,8 @@ class H100Config(PACEGPUConfig):
         self.eval_games = 50
         
         # GPU/performance settings
-        self.selfplay_workers = 16  # Conservative parallel games
-        self.max_batch_size = 64  # Reasonable batch size
+        self.selfplay_workers = 4  # Conservative for debugging batching issues
+        self.max_batch_size = 32  # Moderate batch size
         
         
 

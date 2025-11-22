@@ -71,53 +71,56 @@ class ParallelSelfPlayEngine:
         # Batched evaluator (shared across all workers)
         self.batched_evaluator: Optional[BatchedEvaluator] = None
     
-    def _batch_evaluate_callback(self, batch: List[Tuple]) -> List[Tuple]:
+    def _batch_evaluate_callback(
+        self, 
+        stacked_states_flat: np.ndarray,
+        num_actions_list: List[int],
+        batch_size: int,
+        feature_size: int
+    ) -> List[Tuple]:
         """
-        Callback for batched NN evaluation.
-        Called by C++ BatchedEvaluator with a batch of encoded states.
+        Callback for batched NN evaluation (ULTRA-OPTIMIZED with pre-stacked arrays).
+        Called by C++ BatchedEvaluator with pre-stacked 2D array.
         
         Args:
-            batch: List of (encoded_state_numpy, num_legal_actions) tuples
+            stacked_states_flat: Flat numpy array of shape (batch_size * feature_size,)
+            num_actions_list: List of num_legal_actions for each state
+            batch_size: Number of states in batch
+            feature_size: Size of each encoded state
         
         Returns:
             List of (policy_list, value_float) tuples
         """
-        if not batch:
+        if batch_size == 0:
             return []
         
-        # Convert to torch tensor
-        batch_size = len(batch)
-        encoded_states = [item[0] for item in batch]
-        num_actions_list = [item[1] for item in batch]
+        # OPTIMIZATION: Reshape flat array to 2D (zero-copy view)
+        states_np = stacked_states_flat.reshape(batch_size, feature_size)
         
-        # Stack into batch tensor
-        states_tensor = torch.tensor(
-            np.array(encoded_states),
-            dtype=torch.float32,
-            device=self.device
-        )
+        # Convert to PyTorch tensor
+        states_tensor = torch.from_numpy(states_np).to(self.device, non_blocking=True)
         
         # Run batch inference
         with torch.no_grad():
             policy_logits, values = self.network(states_tensor)
+            
+            # OPTIMIZATION: Batch softmax on GPU
+            policy_probs = torch.softmax(policy_logits, dim=1)
+            
+            # OPTIMIZATION: Single GPU→CPU transfer
+            policy_np = policy_probs.cpu().numpy()
+            values_np = torch.tanh(values).squeeze(1).cpu().numpy()
         
-        # Convert to list of results
+        # OPTIMIZATION: Minimize per-state operations
         results = []
         for i in range(batch_size):
             num_actions = num_actions_list[i]
-            
             if num_actions == 0:
                 results.append(([], 0.0))
-                continue
-            
-            # Get policy for this state's legal actions
-            logits = policy_logits[i, :num_actions]
-            probs = torch.softmax(logits, dim=0).cpu().numpy()
-            
-            # Get value
-            value = torch.tanh(values[i]).item()
-            
-            results.append((probs.tolist(), value))
+            else:
+                policy = policy_np[i, :num_actions].tolist()
+                value = float(values_np[i])
+                results.append((policy, value))
         
         return results
     
@@ -229,8 +232,9 @@ class ParallelSelfPlayEngine:
         state = GameState.create_new_game(num_players, seed)
         
         # Create MCTS with batched evaluator
+        # Pass both the wrapper function (for backward compat) and the batched_evaluator for intra-game batching
         nn_evaluator = make_batched_nn_evaluator(self.batched_evaluator)
-        mcts = AlphaZeroMCTS(self.mcts_config, nn_evaluator)
+        mcts = AlphaZeroMCTS(self.mcts_config, nn_evaluator, self.batched_evaluator)
         
         # Game data for training
         states = []

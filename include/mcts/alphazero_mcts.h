@@ -12,8 +12,15 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <atomic>
+#include <future>
+#include <thread>
 
 namespace catan {
+
+// Forward declaration to avoid circular dependency
+class BatchedEvaluator;
+
 namespace alphazero {
 
 // Neural network evaluation result
@@ -34,6 +41,8 @@ struct AlphaZeroConfig {
     float dirichlet_weight{0.25f};          // Weight of Dirichlet noise at root
     bool add_exploration_noise{true};       // Add noise to root for exploration
     std::uint32_t random_seed{0};           // Seed for randomness (0 = time-based)
+    float virtual_loss_penalty{1.0f};       // Penalty for nodes being explored (enables parallel descent)
+    std::uint32_t num_parallel_sims{8};     // Number of simulations to run in parallel batches
 };
 
 // AlphaZero MCTS node
@@ -51,9 +60,15 @@ struct AlphaZeroNode {
     std::vector<Action> legal_actions{};
     std::vector<float> prior_probs{};
     
+    // Cached prior probability for this node (avoids O(n) search in parent)
+    float cached_prior{0.0f};
+    
     // Statistics
     std::uint32_t visit_count{0};
     float value_sum{0.0f};      // Sum of values from current player's perspective
+    
+    // Virtual loss for parallel tree descent (thread-safe)
+    std::atomic<int> virtual_loss{0};
     
     // Player who made the move to reach this node
     std::uint8_t player_idx{0};
@@ -77,30 +92,24 @@ struct AlphaZeroNode {
         return value_sum / static_cast<float>(visit_count);
     }
     
-    // PUCT score for child selection
-    // U(s,a) = Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-    float get_puct_score(float cpuct, float parent_visit_sqrt) const {
-        float q_value = get_q_value();
+    // PUCT score for child selection with virtual loss penalty
+    // U(s,a) = Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a)) - virtual_loss_penalty
+    float get_puct_score(float cpuct, float parent_visit_sqrt, float virtual_loss_penalty = 1.0f) const {
+        // Q-value with virtual loss penalty applied
+        float effective_visit_count = static_cast<float>(visit_count) + static_cast<float>(virtual_loss.load());
+        float q_value = (effective_visit_count > 0) ? 
+            (value_sum - static_cast<float>(virtual_loss.load()) * virtual_loss_penalty) / effective_visit_count : 0.0f;
         
-        // Find this node's index in parent's children to get prior
         if (parent == nullptr) return q_value;
         
-        float prior = 0.0f;
-        for (std::size_t i = 0; i < parent->children.size(); ++i) {
-            if (parent->children[i].get() == this) {
-                prior = parent->prior_probs[i];
-                break;
-            }
-        }
-        
-        // PUCT formula
-        float exploration = cpuct * prior * parent_visit_sqrt / (1.0f + static_cast<float>(visit_count));
+        // Use cached prior (set during child creation) instead of O(n) search
+        float exploration = cpuct * cached_prior * parent_visit_sqrt / (1.0f + effective_visit_count);
         
         return q_value + exploration;
     }
     
-    // Select best child using PUCT
-    AlphaZeroNode* select_child(float cpuct) {
+    // Select best child using PUCT with virtual loss
+    AlphaZeroNode* select_child(float cpuct, float virtual_loss_penalty = 1.0f) {
         if (children.empty()) return nullptr;
         
         float parent_visit_sqrt = std::sqrt(static_cast<float>(visit_count));
@@ -109,7 +118,7 @@ struct AlphaZeroNode {
         float best_score = -std::numeric_limits<float>::infinity();
         
         for (auto& child : children) {
-            float score = child->get_puct_score(cpuct, parent_visit_sqrt);
+            float score = child->get_puct_score(cpuct, parent_visit_sqrt, virtual_loss_penalty);
             if (score > best_score) {
                 best_score = score;
                 best_child = child.get();
@@ -138,9 +147,11 @@ struct AlphaZeroNode {
 // AlphaZero MCTS search engine
 class AlphaZeroMCTS {
 public:
-    AlphaZeroMCTS(const AlphaZeroConfig& config, NNEvaluator evaluator)
+    AlphaZeroMCTS(const AlphaZeroConfig& config, NNEvaluator evaluator,
+                  std::shared_ptr<BatchedEvaluator> batched_evaluator = nullptr)
         : config_(config)
         , evaluator_(std::move(evaluator))
+        , batched_evaluator_(batched_evaluator)
         , rng_(config.random_seed == 0 ? std::random_device{}() : config.random_seed)
     {}
     
@@ -156,8 +167,15 @@ public:
 private:
     // MCTS phases
     AlphaZeroNode* select(AlphaZeroNode* node, GameState& state);
+    AlphaZeroNode* select_with_virtual_loss(AlphaZeroNode* node, GameState& state);
     void expand_and_evaluate(AlphaZeroNode* node, GameState& state);
+    
+    // Batched evaluation phases
+    bool prepare_for_evaluation(AlphaZeroNode* node, GameState& state);
+    void apply_evaluation(AlphaZeroNode* node, const NNEvaluation& eval, GameState& state);
+    
     void backpropagate(AlphaZeroNode* node, float value);
+    void backpropagate_and_remove_virtual_loss(AlphaZeroNode* node, float value);
     
     // Add Dirichlet noise to root for exploration
     void add_exploration_noise(AlphaZeroNode* root);
@@ -167,6 +185,9 @@ private:
     
     // Neural network evaluator
     NNEvaluator evaluator_;
+    
+    // Optional batched evaluator for intra-game batching
+    std::shared_ptr<BatchedEvaluator> batched_evaluator_;
     
     // Random number generator
     std::mt19937 rng_;

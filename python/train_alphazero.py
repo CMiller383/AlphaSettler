@@ -42,8 +42,11 @@ from parallel_selfplay import ParallelSelfPlayEngine
 
 # For PACE GPU Cluster:
 # TRAINING_CONFIG = PACEGPUConfig()        # A100 optimized (100k games, ~40-80 hours)
-TRAINING_CONFIG = H100Config()           # H100 optimized (100k games, ~30-60 hours)
+# TRAINING_CONFIG = H100Config()           # H100 optimized (ready for full training)
 # TRAINING_CONFIG = H200Config()           # H200 optimized (100k games, ~20-40 hours)
+
+# For testing:
+TRAINING_CONFIG = QuickTestConfig()      # 1000 games benchmark test
 
 # ============================================================================
 
@@ -216,12 +219,17 @@ class AlphaZeroTrainer:
         mcts_config.dirichlet_weight = self.config.dirichlet_weight
         mcts_config.add_exploration_noise = True
         
-        # Batched evaluator config
+        # Virtual loss settings for parallel tree descent (GPU optimization)
+        mcts_config.num_parallel_sims = self.config.mcts_simulations  # Run all sims in parallel
+        mcts_config.virtual_loss_penalty = 1.0  # Standard virtual loss penalty
+        
+        # Batched evaluator config  
         batch_config = BatchedEvaluatorConfig()
         batch_config.max_batch_size = self.config.max_batch_size
         batch_config.min_batch_size = 1
-        batch_config.timeout_ms = 5  # Short timeout for responsiveness
-        batch_config.enable_batching = True
+        batch_config.timeout_ms = 10  # 10ms optimal timeout for batching
+        batch_config.enable_batching = True  # Re-enable batching
+
         
         # Determine number of workers (parallel games)
         if self.config.selfplay_workers is not None:
@@ -260,6 +268,15 @@ class AlphaZeroTrainer:
                 
                 # Encode state
                 features = self.encoder.encode_state(state, player)
+                
+                # Convert to numpy array immediately to ensure proper type
+                features = np.array(features, dtype=np.float32)
+                
+                # Sanity check for NaN/Inf during encoding
+                if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+                    print(f"WARNING: NaN/Inf detected during state encoding at game {i}!")
+                    print(f"  Player: {player}, Turn: {state.turn_number}")
+                    continue  # Skip this corrupted example
                 
                 # Get legal actions for this state
                 legal_actions = generate_legal_actions(state)
@@ -319,9 +336,20 @@ class AlphaZeroTrainer:
             target = np.zeros(action_space_size, dtype=np.float32)
             probs = ex['policy']          # shape (num_legal,)
             indices = ex['legal_indices'] # shape (num_legal,)
+            
+            # Only use indices within the network's action space
             for idx, p in zip(indices, probs):
                 if 0 <= idx < action_space_size:
                     target[idx] = p
+            
+            # Renormalize in case some indices were out of bounds
+            target_sum = target.sum()
+            if target_sum > 0:
+                target = target / target_sum
+            else:
+                # All indices were out of bounds - use uniform over first action
+                target[0] = 1.0
+            
             policy_targets.append(target)
         policy_targets = torch.from_numpy(np.stack(policy_targets, axis=0)).float().to(self.config.device)
         
@@ -589,6 +617,13 @@ def main():
         trainer.generate_self_play_data(config.games_per_iteration)
         sp_time = time.time() - sp_start
         print(f"✓ Self-play completed in {sp_time:.1f}s")
+        
+        # Force cleanup to prevent segfaults between iterations
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Wait for all CUDA operations to finish
+            torch.cuda.empty_cache()
         
         # Train
         print(f"\n[2/3] Training: Processing {len(trainer.replay_buffer)} examples for {config.training_epochs_per_iteration} epochs...")

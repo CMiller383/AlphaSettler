@@ -389,15 +389,21 @@ PYBIND11_MODULE(catan_engine, m) {
             "Whether to add exploration noise at root")
         .def_readwrite("random_seed", &AlphaZeroConfig::random_seed,
             "Random seed (0 = time-based)")
+        .def_readwrite("virtual_loss_penalty", &AlphaZeroConfig::virtual_loss_penalty,
+            "Penalty for nodes under exploration (enables parallel tree descent)")
+        .def_readwrite("num_parallel_sims", &AlphaZeroConfig::num_parallel_sims,
+            "Number of simulations to run in parallel batches")
         .def("__repr__", [](const AlphaZeroConfig& cfg) {
             return "AlphaZeroConfig(sims=" + std::to_string(cfg.num_simulations) +
-                   ", cpuct=" + std::to_string(cfg.cpuct) + ")";
+                   ", cpuct=" + std::to_string(cfg.cpuct) + 
+                   ", parallel=" + std::to_string(cfg.num_parallel_sims) + ")";
         });
     
     py::class_<AlphaZeroMCTS>(m, "AlphaZeroMCTS")
-        .def(py::init<const AlphaZeroConfig&, NNEvaluator>(),
+        .def(py::init<const AlphaZeroConfig&, NNEvaluator, std::shared_ptr<BatchedEvaluator>>(),
             py::arg("config"),
             py::arg("evaluator"),
+            py::arg("batched_evaluator") = nullptr,
             "Create AlphaZero MCTS with configuration and NN evaluator")
         .def("search", &AlphaZeroMCTS::search,
             py::arg("state"),
@@ -473,7 +479,55 @@ PYBIND11_MODULE(catan_engine, m) {
             "If false, process immediately (for debugging)");
     
     py::class_<BatchedEvaluator, std::shared_ptr<BatchedEvaluator>>(m, "BatchedEvaluator")
-        .def(py::init<const BatchedEvaluatorConfig&, BatchEvaluatorCallback>(),
+        .def(py::init([](const BatchedEvaluatorConfig& config, py::function py_callback) {
+            // Wrap Python callback to handle type conversions
+            BatchEvaluatorCallback cpp_callback = [py_callback](
+                const std::vector<float>& stacked_states,
+                const std::vector<std::size_t>& num_legal_actions,
+                std::size_t batch_size,
+                std::size_t feature_size
+            ) -> std::vector<std::pair<std::vector<float>, float>> {
+                py::gil_scoped_acquire acquire;
+                
+                // Convert flat vector to numpy array (zero-copy)
+                py::array_t<float> states_array(
+                    {static_cast<py::ssize_t>(stacked_states.size())},
+                    {sizeof(float)},
+                    stacked_states.data()
+                );
+                
+                // Call Python callback
+                py::object result = py_callback(
+                    states_array,
+                    num_legal_actions,
+                    batch_size,
+                    feature_size
+                );
+                
+                // Convert result back to C++
+                py::list result_list = result.cast<py::list>();
+                std::vector<std::pair<std::vector<float>, float>> cpp_result;
+                cpp_result.reserve(result_list.size());
+                
+                for (const auto& item : result_list) {
+                    py::tuple tuple = item.cast<py::tuple>();
+                    py::list policy_list = tuple[0].cast<py::list>();
+                    float value = tuple[1].cast<float>();
+                    
+                    std::vector<float> policy;
+                    policy.reserve(policy_list.size());
+                    for (const auto& p : policy_list) {
+                        policy.push_back(p.cast<float>());
+                    }
+                    
+                    cpp_result.emplace_back(std::move(policy), value);
+                }
+                
+                return cpp_result;
+            };
+            
+            return new BatchedEvaluator(config, cpp_callback);
+        }),
             py::arg("config"),
             py::arg("callback"),
             "Create batched evaluator with configuration and callback")

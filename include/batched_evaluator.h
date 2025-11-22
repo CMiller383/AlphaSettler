@@ -36,11 +36,17 @@ struct EvaluationResponse {
 };
 
 // Batch evaluation callback: takes multiple states, returns multiple evaluations
-// Input: vector of (encoded_state, num_legal_actions) pairs
+// OPTIMIZED: Input is pre-stacked 2D array to avoid Python list conversion overhead
+// Input: (stacked_states_flat, num_legal_actions, batch_size, feature_size)
+//   - stacked_states_flat: flat array of size (batch_size * feature_size)
+//   - num_legal_actions: vector of size batch_size
 // Output: vector of (policy, value) pairs in same order
 using BatchEvaluatorCallback = std::function<
     std::vector<std::pair<std::vector<float>, float>>(
-        const std::vector<std::pair<std::vector<float>, std::size_t>>&
+        const std::vector<float>&,           // stacked states (flat)
+        const std::vector<std::size_t>&,     // num_legal_actions
+        std::size_t,                         // batch_size
+        std::size_t                          // feature_size
     )
 >;
 
@@ -69,6 +75,14 @@ public:
         const GameState& state,
         std::uint8_t perspective_player,
         std::size_t num_legal_actions
+    );
+    
+    // Batch evaluate multiple states at once (for intra-game parallelism)
+    // Returns results in same order as input
+    std::vector<std::pair<std::vector<float>, float>> evaluate_batch(
+        const std::vector<const GameState*>& states,
+        const std::vector<std::uint8_t>& perspective_players,
+        const std::vector<std::size_t>& num_legal_actions
     );
     
     // Start the batch processing thread

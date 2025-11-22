@@ -2,9 +2,12 @@
 // Implementation of AlphaZero-style MCTS with neural network guidance.
 
 #include "mcts/alphazero_mcts.h"
+#include "batched_evaluator.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <thread>
+#include <vector>
 
 namespace catan {
 namespace alphazero {
@@ -42,21 +45,82 @@ Action AlphaZeroMCTS::search(const GameState& root_state) {
         add_exploration_noise(root_.get());
     }
     
-    // Run MCTS simulations
-    for (std::uint32_t i = 0; i < config_.num_simulations; ++i) {
-        // Copy state for this simulation
-        GameState state = root_state;
+    // Run MCTS simulations in parallel batches for better GPU utilization
+    std::uint32_t num_batches = (config_.num_simulations + config_.num_parallel_sims - 1) / config_.num_parallel_sims;
+    
+    for (std::uint32_t batch = 0; batch < num_batches; ++batch) {
+        std::uint32_t batch_size = std::min(config_.num_parallel_sims, 
+                                            config_.num_simulations - batch * config_.num_parallel_sims);
         
-        // 1. Selection: traverse tree using PUCT
-        AlphaZeroNode* node = select(root_.get(), state);
+        // Store simulation paths and states for this batch
+        std::vector<std::pair<AlphaZeroNode*, GameState>> sim_paths;
+        sim_paths.reserve(batch_size);
         
-        // 2. Expansion & Evaluation: expand node and get NN value
-        expand_and_evaluate(node, state);
+        // Phase 1: Selection with virtual loss - collect all leaf nodes
+        for (std::uint32_t i = 0; i < batch_size; ++i) {
+            GameState state = root_state;
+            AlphaZeroNode* node = select_with_virtual_loss(root_.get(), state);
+            sim_paths.emplace_back(node, state);
+        }
         
-        // 3. Backpropagation: update statistics up the tree
-        // Note: value is already from root player's perspective
-        float value = node->get_q_value();
-        backpropagate(node->parent, value);
+        // Phase 2: Prepare nodes and collect those needing NN evaluation
+        std::vector<std::pair<AlphaZeroNode*, GameState*>> nodes_to_evaluate;
+        nodes_to_evaluate.reserve(batch_size);
+        
+        for (auto& [node, state] : sim_paths) {
+            bool needs_eval = prepare_for_evaluation(node, state);
+            if (needs_eval) {
+                nodes_to_evaluate.emplace_back(node, &state);
+            }
+        }
+        
+        // Phase 3: Evaluate all nodes
+        std::vector<NNEvaluation> evaluations;
+        evaluations.reserve(nodes_to_evaluate.size());
+        
+        if (batched_evaluator_ && nodes_to_evaluate.size() > 1) {
+            // Use batched evaluation for multiple nodes
+            std::vector<const GameState*> states;
+            std::vector<std::uint8_t> players;
+            std::vector<std::size_t> num_actions;
+            
+            states.reserve(nodes_to_evaluate.size());
+            players.reserve(nodes_to_evaluate.size());
+            num_actions.reserve(nodes_to_evaluate.size());
+            
+            for (auto& [node, state_ptr] : nodes_to_evaluate) {
+                states.push_back(state_ptr);
+                players.push_back(state_ptr->current_player);
+                num_actions.push_back(node->legal_actions.size());
+            }
+            
+            // Call batch evaluation
+            auto batch_results = batched_evaluator_->evaluate_batch(states, players, num_actions);
+            
+            // Convert to NNEvaluation format
+            for (auto& [policy, value] : batch_results) {
+                NNEvaluation eval;
+                eval.policy = std::move(policy);
+                eval.value = value;
+                evaluations.push_back(std::move(eval));
+            }
+        } else {
+            // Fall back to sequential evaluation
+            for (auto& [node, state_ptr] : nodes_to_evaluate) {
+                evaluations.push_back(evaluator_(*state_ptr));
+            }
+        }
+        
+        // Phase 4: Apply evaluation results to nodes
+        for (std::size_t i = 0; i < nodes_to_evaluate.size(); ++i) {
+            apply_evaluation(nodes_to_evaluate[i].first, evaluations[i], *nodes_to_evaluate[i].second);
+        }
+        
+        // Phase 5: Backpropagation and remove virtual loss
+        for (auto& [node, state] : sim_paths) {
+            float value = node->get_q_value();
+            backpropagate_and_remove_virtual_loss(node, value);
+        }
     }
     
     // Select best action based on visit counts
@@ -105,6 +169,26 @@ AlphaZeroNode* AlphaZeroMCTS::select(AlphaZeroNode* node, GameState& state) {
         if (node == nullptr) {
             break; // Safety
         }
+        
+        // Apply action to advance state
+        apply_action(state, node->action, rng_());
+    }
+    
+    return node;
+}
+
+AlphaZeroNode* AlphaZeroMCTS::select_with_virtual_loss(AlphaZeroNode* node, GameState& state) {
+    // Traverse tree until we reach a leaf node, applying virtual loss along the path
+    while (!node->is_terminal(state) && node->is_fully_expanded()) {
+        // Select child using PUCT with virtual loss penalty
+        node = node->select_child(config_.cpuct, config_.virtual_loss_penalty);
+        
+        if (node == nullptr) {
+            break; // Safety
+        }
+        
+        // Apply virtual loss to discourage other threads from selecting this node
+        node->virtual_loss.fetch_add(1, std::memory_order_relaxed);
         
         // Apply action to advance state
         apply_action(state, node->action, rng_());
@@ -178,6 +262,7 @@ void AlphaZeroMCTS::expand_and_evaluate(AlphaZeroNode* node, GameState& state) {
         child->parent = node;
         child->action = node->legal_actions[i];
         child->root_player_idx = node->root_player_idx;
+        child->cached_prior = node->prior_probs[i];  // Cache prior to avoid search later
         
         // Apply action to determine child's player
         GameState child_state = state;
@@ -201,6 +286,116 @@ void AlphaZeroMCTS::backpropagate(AlphaZeroNode* node, float value) {
         node->value_sum += value;
         node = node->parent;
     }
+}
+
+void AlphaZeroMCTS::backpropagate_and_remove_virtual_loss(AlphaZeroNode* node, float value) {
+    // Propagate value and remove virtual loss up the tree
+    // Note: Start from node->parent since the leaf node doesn't have virtual loss applied
+    AlphaZeroNode* current = node->parent;
+    
+    // Update leaf node statistics
+    if (node != nullptr) {
+        node->visit_count++;
+        node->value_sum += value;
+    }
+    
+    // Propagate up, removing virtual loss from each node
+    while (current != nullptr) {
+        current->visit_count++;
+        current->value_sum += value;
+        
+        // Remove virtual loss (it was added during selection)
+        int prev_vl = current->virtual_loss.fetch_sub(1, std::memory_order_relaxed);
+        
+        // Safety check: virtual loss should never go negative
+        if (prev_vl <= 0) {
+            // This shouldn't happen, but handle gracefully
+            current->virtual_loss.store(0, std::memory_order_relaxed);
+        }
+        
+        current = current->parent;
+    }
+}
+
+bool AlphaZeroMCTS::prepare_for_evaluation(AlphaZeroNode* node, GameState& state) {
+    // Terminal node - set value directly, no NN needed
+    if (node->is_terminal(state)) {
+        std::uint8_t winner = state.get_winner();
+        float value = (winner == node->root_player_idx) ? 1.0f : 0.0f;
+        node->value_sum = value;
+        node->visit_count = 1;
+        return false;  // No NN evaluation needed
+    }
+    
+    // Already expanded node - needs re-evaluation
+    if (!node->children.empty()) {
+        // Will need NN evaluation for value update
+        return true;
+    }
+    
+    // First visit - generate legal actions
+    if (node->legal_actions.empty()) {
+        generate_legal_actions(state, node->legal_actions);
+    }
+    
+    if (node->legal_actions.empty()) {
+        // Stuck state - no NN needed
+        node->visit_count = 1;
+        return false;
+    }
+    
+    // Node needs expansion - requires NN evaluation
+    return true;
+}
+
+void AlphaZeroMCTS::apply_evaluation(AlphaZeroNode* node, const NNEvaluation& eval, GameState& state) {
+    // This is called after NN evaluation completes
+    
+    // If already expanded, just update value
+    if (!node->children.empty()) {
+        float value = eval.value;
+        node->value_sum += value;
+        node->visit_count++;
+        return;
+    }
+    
+    // First expansion - store priors and create children
+    if (eval.policy.size() == node->legal_actions.size()) {
+        node->prior_probs = eval.policy;
+    } else {
+        // Fallback: uniform priors
+        float uniform_prob = 1.0f / node->legal_actions.size();
+        node->prior_probs.assign(node->legal_actions.size(), uniform_prob);
+    }
+    
+    // Normalize priors
+    float prior_sum = 0.0f;
+    for (float p : node->prior_probs) prior_sum += p;
+    if (prior_sum > 0.0f) {
+        for (float& p : node->prior_probs) p /= prior_sum;
+    }
+    
+    // Create child nodes
+    node->children.reserve(node->legal_actions.size());
+    for (std::size_t i = 0; i < node->legal_actions.size(); ++i) {
+        auto child = std::make_unique<AlphaZeroNode>();
+        child->parent = node;
+        child->action = node->legal_actions[i];
+        child->root_player_idx = node->root_player_idx;
+        child->cached_prior = node->prior_probs[i];
+        
+        // Apply action to determine child's player
+        GameState child_state = state;
+        apply_action(child_state, child->action, rng_());
+        child->player_idx = child_state.current_player;
+        
+        node->children.push_back(std::move(child));
+    }
+    
+    // Update node with NN value
+    float value = eval.value;
+    node->value_sum += value;
+    node->visit_count++;
 }
 
 void AlphaZeroMCTS::add_exploration_noise(AlphaZeroNode* root) {

@@ -127,8 +127,10 @@ class CatanNetwork(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Convert to tensor
+            # Convert to tensor and move to correct device
             state_tensor = torch.from_numpy(state_features).unsqueeze(0).float()
+            device = next(self.parameters()).device
+            state_tensor = state_tensor.to(device)
             
             # Create action mask for local indices 0..N-1, clamped to
             # the network's max_action_space.
@@ -136,7 +138,7 @@ class CatanNetwork(nn.Module):
             if not valid_indices:
                 valid_indices = [0]
 
-            action_mask = torch.zeros(1, self.max_action_space, dtype=torch.bool)
+            action_mask = torch.zeros(1, self.max_action_space, dtype=torch.bool, device=device)
             for idx in valid_indices:
                 action_mask[0, idx] = True
             

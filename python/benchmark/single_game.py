@@ -58,6 +58,7 @@ class TimedAlphaZeroRunner:
         # State encoding
         enc_start = time.perf_counter()
         features = self.encoder.encode_state(state, player)
+        features = np.array(features, dtype=np.float32)  # Ensure proper type
         self.timers["state_encoding"] += time.perf_counter() - enc_start
 
         # Legal actions
@@ -107,6 +108,10 @@ class TimedAlphaZeroRunner:
         mcts_config.dirichlet_weight = self.config.dirichlet_weight
         mcts_config.add_exploration_noise = True  # Enable exploration noise
         mcts_config.random_seed = seed  # Use game seed for reproducibility
+        
+        # Virtual loss for parallel tree descent
+        mcts_config.num_parallel_sims = self.config.mcts_simulations
+        mcts_config.virtual_loss_penalty = 1.0
 
         turn_count = 0
         max_turns = 500
