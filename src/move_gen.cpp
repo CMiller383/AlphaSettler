@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <queue>
 #include <array>
+#include <random>
 
 namespace catan {
 
@@ -46,16 +47,7 @@ bool is_connected_to_road_network(const GameState& state, std::uint8_t player_id
                                   std::uint8_t vertex_idx) {
     if (vertex_idx >= NUM_VERTICES) return false;
 
-    // A vertex is connected if:
-    // 1. Player has a settlement/city at this vertex, OR
-    // 2. Player has a road on any adjacent edge
-
-    const Piece& vertex_piece = state.vertex_pieces[vertex_idx];
-    if (vertex_piece.type != PieceType::None && vertex_piece.owner == player_idx) {
-        return true;
-    }
-
-    // Check adjacent edges for player's roads
+    // A vertex is connected to the player's road network if the player has a road on any adjacent edge
     const Vertex& vertex = state.board.vertices[vertex_idx];
     for (std::uint8_t edge_idx : vertex.edges) {
         if (edge_idx == INVALID_EDGE) continue;
@@ -131,8 +123,18 @@ std::size_t generate_initial_settlement_placements(const GameState& state,
             out.push_back(Action::place_initial_settlement(v));
         }
     }
+    
+    // CRITICAL FIX: Shuffle initial placements to prevent sequential bias!
+    // Without shuffling, MCTS with few simulations tends to pick low-index vertices
+    // (vertex 0, 1, 2, ...) leading to poor placements
+    std::size_t added = out.size() - initial_size;
+    if (added > 1) {
+        // Shuffle only the newly added actions using thread-local RNG
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        std::shuffle(out.begin() + initial_size, out.end(), rng);
+    }
 
-    return out.size() - initial_size;
+    return added;
 }
 
 std::size_t generate_initial_road_placements(const GameState& state, 

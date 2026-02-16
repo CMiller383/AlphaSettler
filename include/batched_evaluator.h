@@ -37,14 +37,16 @@ struct EvaluationResponse {
 
 // Batch evaluation callback: takes multiple states, returns multiple evaluations
 // OPTIMIZED: Input is pre-stacked 2D array to avoid Python list conversion overhead
-// Input: (stacked_states_flat, num_legal_actions, batch_size, feature_size)
+// Input: (stacked_states_flat, num_legal_actions, action_types_flat, batch_size, feature_size)
 //   - stacked_states_flat: flat array of size (batch_size * feature_size)
 //   - num_legal_actions: vector of size batch_size
+//   - action_types_flat: flat array of action types for all actions in batch
 // Output: vector of (policy, value) pairs in same order
 using BatchEvaluatorCallback = std::function<
     std::vector<std::pair<std::vector<float>, float>>(
         const std::vector<float>&,           // stacked states (flat)
         const std::vector<std::size_t>&,     // num_legal_actions
+        const std::vector<std::uint8_t>&,    // action types (flat)
         std::size_t,                         // batch_size
         std::size_t                          // feature_size
     )

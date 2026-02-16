@@ -54,7 +54,17 @@ std::pair<std::vector<float>, float> BatchedEvaluator::evaluate(
         std::vector<float> encoded = encoder_.encode_state(state, perspective_player);
         std::size_t feature_size = encoder_.get_feature_size();
         std::vector<std::size_t> num_actions_vec = {num_legal_actions};
-        auto batch_result = callback_(encoded, num_actions_vec, 1, feature_size);
+        
+        // Get action types
+        std::vector<Action> legal_actions;
+        generate_legal_actions(state, legal_actions);
+        std::vector<std::uint8_t> action_types;
+        action_types.reserve(legal_actions.size());
+        for (const auto& action : legal_actions) {
+            action_types.push_back(static_cast<std::uint8_t>(action.type));
+        }
+        
+        auto batch_result = callback_(encoded, num_actions_vec, action_types, 1, feature_size);
         return batch_result[0];
     }
     
@@ -105,17 +115,27 @@ std::vector<std::pair<std::vector<float>, float>> BatchedEvaluator::evaluate_bat
     std::vector<float> stacked_states;
     stacked_states.reserve(batch_size * feature_size);
     
+    // Collect action types for all states (flat array)
+    std::vector<std::uint8_t> action_types_flat;
+    
     // Encode and stack states directly
     for (std::size_t i = 0; i < batch_size; ++i) {
         std::vector<float> encoded = encoder_.encode_state(*states[i], perspective_players[i]);
         stacked_states.insert(stacked_states.end(), encoded.begin(), encoded.end());
+        
+        // Get action types for this state
+        std::vector<Action> legal_actions;
+        generate_legal_actions(*states[i], legal_actions);
+        for (const auto& action : legal_actions) {
+            action_types_flat.push_back(static_cast<std::uint8_t>(action.type));
+        }
     }
     
     // Extract num_legal_actions into separate vector
     std::vector<std::size_t> num_actions_vec(num_legal_actions.begin(), num_legal_actions.end());
     
     // Call callback with pre-stacked data (caller holds GIL, so this is safe)
-    return callback_(stacked_states, num_actions_vec, batch_size, feature_size);
+    return callback_(stacked_states, num_actions_vec, action_types_flat, batch_size, feature_size);
 }
 
 void BatchedEvaluator::process_batches() {
@@ -178,6 +198,8 @@ void BatchedEvaluator::process_batch(const std::vector<EvaluationRequest>& batch
     std::vector<std::size_t> num_legal_actions_vec;
     num_legal_actions_vec.reserve(batch_size);
     
+    std::vector<std::uint8_t> action_types_flat;
+    
     for (const auto& request : batch) {
         // Encode state
         std::vector<float> encoded = encoder_.encode_state(
@@ -188,15 +210,20 @@ void BatchedEvaluator::process_batch(const std::vector<EvaluationRequest>& batch
         // Stack into flat array
         stacked_states.insert(stacked_states.end(), encoded.begin(), encoded.end());
         
-        // Get number of legal actions for this state
+        // Get legal actions and their types
         std::vector<Action> legal_actions;
         generate_legal_actions(request.state, legal_actions);
         num_legal_actions_vec.push_back(legal_actions.size());
+        
+        // Collect action types (flat across all states)
+        for (const auto& action : legal_actions) {
+            action_types_flat.push_back(static_cast<std::uint8_t>(action.type));
+        }
     }
     
-    // Call neural network with pre-stacked states
+    // Call neural network with pre-stacked states and action types
     std::vector<std::pair<std::vector<float>, float>> results = 
-        callback_(stacked_states, num_legal_actions_vec, batch_size, feature_size);
+        callback_(stacked_states, num_legal_actions_vec, action_types_flat, batch_size, feature_size);
     
     // Distribute responses
     {

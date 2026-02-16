@@ -17,7 +17,8 @@ from tqdm import tqdm
 
 from catan_engine import (
     GameState, AlphaZeroMCTS, AlphaZeroConfig, NNEvaluation,
-    generate_legal_actions, apply_action, BatchedEvaluatorConfig
+    generate_legal_actions, apply_action, BatchedEvaluatorConfig,
+    ActionType
 )
 from state_encoder import StateEncoder
 from catan_network import CatanNetwork
@@ -128,12 +129,55 @@ class AlphaZeroTrainer:
         # NN prediction in full action space, then restrict to legal actions
         policy_probs, value = self.network.predict(features, legal_indices)
         
+        # HEURISTIC FIX: Adjust policy to encourage building, discourage EndTurn
+        # This helps early training when network outputs are nearly uniform
+        policy_probs = self._adjust_policy_heuristic(policy_probs, legal_actions)
+        
         # Create result
         result = NNEvaluation()
         result.policy = policy_probs.tolist()
         result.value = float(value)
         
         return result
+    
+    def _adjust_policy_heuristic(self, policy, actions):
+        """
+        Apply heuristic adjustments to policy to break deadlocks.
+        
+        Strongly encourages building actions, discourages EndTurn when buildings available.
+        This is critical for early training when the network is essentially random.
+        """
+        import numpy as np
+        adjusted = policy.copy()
+        
+        # Check if any building actions are available
+        has_buildings = any(a.type in [ActionType.PlaceSettlement, ActionType.PlaceRoad, 
+                                       ActionType.UpgradeToCity] for a in actions)
+        
+        for i, action in enumerate(actions):
+            if action.type == ActionType.EndTurn:
+                # Discourage EndTurn, especially when buildings available
+                if has_buildings:
+                    adjusted[i] *= 0.05  # Strong suppression
+                else:
+                    adjusted[i] *= 0.3  # Mild suppression
+            elif action.type in [ActionType.PlaceSettlement, ActionType.PlaceRoad, 
+                                ActionType.UpgradeToCity]:
+                # Strongly encourage building
+                adjusted[i] *= 10.0
+            elif action.type in [ActionType.BankTrade, ActionType.PortTrade]:
+                # Mildly encourage trading
+                adjusted[i] *= 2.0
+        
+        # Renormalize
+        total = adjusted.sum()
+        if total > 0:
+            adjusted /= total
+        else:
+            # Fallback to uniform if something went wrong
+            adjusted = np.ones_like(policy) / len(policy)
+        
+        return adjusted
     
     def self_play_game(self, mcts_config: AlphaZeroConfig):
         """
@@ -257,11 +301,25 @@ class AlphaZeroTrainer:
         
         # Convert results to training examples
         total_examples = 0
+        completed_games = sum(1 for r in results if r['winner'] is not None)
+        total_turns = [r['turns'] for r in results]
+        avg_turns = sum(total_turns) / len(total_turns) if total_turns else 0
+        
+        print(f"  Game completion: {completed_games}/{len(results)} ({100*completed_games/len(results):.1f}%)")
+        print(f"  Avg turns/game: {avg_turns:.1f}")
+        
         for game_result in results:
             # Convert each game to training examples
             states = game_result['states']
             policies = game_result['policies']
             winner = game_result['winner']
+            
+            # CRITICAL FIX: Only train on completed games!
+            # Training on incomplete games teaches the network that stuck states are normal
+            if winner is None:
+                # Game didn't finish - discard these examples
+                self.self_play_games += 1
+                continue
             
             for i, (state, policy) in enumerate(zip(states, policies)):
                 player = state.current_player
@@ -286,12 +344,8 @@ class AlphaZeroTrainer:
                 policy_arr = np.array(policy[:num_legal], dtype=np.float32)
                 legal_indices = np.arange(num_legal, dtype=np.int32)
                 
-                # Determine value based on outcome
-                if winner is not None:
-                    value = 1.0 if player == winner else 0.0
-                else:
-                    # Game didn't finish - use VP as proxy
-                    value = state.players[player].total_victory_points() / 10.0
+                # Value: 1 for winner, 0 for losers (only completed games reach here)
+                value = 1.0 if player == winner else 0.0
                 
                 # Add to replay buffer
                 self.replay_buffer.append({
@@ -309,7 +363,10 @@ class AlphaZeroTrainer:
         print(f"  Parallel workers: {num_workers}")
         print(f"  Total games: {len(results)}")
         print(f"  Avg turns/game: {sum(r['turns'] for r in results) / len(results):.1f}")
-        print(f"  Training examples: {total_examples}")
+        print(f"  Training examples: {total_examples} (from {completed_games} completed games)")
+        
+        if completed_games == 0:
+            print(f"  ⚠️  WARNING: No completed games! Cannot train without successful game data.")
     
     def train_step(self, batch_size):
         """

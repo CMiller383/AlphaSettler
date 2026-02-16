@@ -75,6 +75,7 @@ class ParallelSelfPlayEngine:
         self, 
         stacked_states_flat: np.ndarray,
         num_actions_list: List[int],
+        action_types_flat: np.ndarray,
         batch_size: int,
         feature_size: int
     ) -> List[Tuple]:
@@ -85,6 +86,7 @@ class ParallelSelfPlayEngine:
         Args:
             stacked_states_flat: Flat numpy array of shape (batch_size * feature_size,)
             num_actions_list: List of num_legal_actions for each state
+            action_types_flat: Flat array of action types (uint8) for all actions in batch
             batch_size: Number of states in batch
             feature_size: Size of each encoded state
         
@@ -111,6 +113,13 @@ class ParallelSelfPlayEngine:
             policy_np = policy_probs.cpu().numpy()
             values_np = torch.tanh(values).squeeze(1).cpu().numpy()
         
+        # Apply heuristic adjustments to policy using action types
+        policy_np = self._apply_heuristic_to_batch(
+            policy_np, 
+            num_actions_list, 
+            action_types_flat
+        )
+        
         # OPTIMIZATION: Minimize per-state operations
         results = []
         for i in range(batch_size):
@@ -123,6 +132,89 @@ class ParallelSelfPlayEngine:
                 results.append((policy, value))
         
         return results
+    
+    def _apply_heuristic_to_batch(
+        self,
+        policy_np: np.ndarray,
+        num_actions_list: List[int],
+        action_types_flat: np.ndarray
+    ) -> np.ndarray:
+        """
+        Apply heuristic adjustments to batched policies.
+        
+        Strongly encourages building actions, discourages EndTurn.
+        This is critical for early training when network is essentially random.
+        
+        Args:
+            policy_np: Array of shape (batch_size, max_actions)
+            num_actions_list: Number of legal actions for each state
+            action_types_flat: Flat array of action types (ActionType enum values as uint8)
+        
+        Returns:
+            Adjusted policy array (same shape)
+        """
+        from catan_engine import ActionType
+        
+        # Action type constants (from C++ enum)
+        ENDTURN = int(ActionType.EndTurn)
+        PLACE_INITIAL_SETTLEMENT = int(ActionType.PlaceInitialSettlement)
+        PLACE_INITIAL_ROAD = int(ActionType.PlaceInitialRoad)
+        PLACE_SETTLEMENT = int(ActionType.PlaceSettlement)
+        PLACE_ROAD = int(ActionType.PlaceRoad)
+        UPGRADE_CITY = int(ActionType.UpgradeToCity)
+        BANK_TRADE = int(ActionType.BankTrade)
+        PORT_TRADE = int(ActionType.PortTrade)
+        
+        adjusted = policy_np.copy()
+        
+        action_idx = 0  # Index into action_types_flat
+        for batch_idx, num_actions in enumerate(num_actions_list):
+            if num_actions == 0:
+                continue
+            
+            # Extract action types for this state
+            action_types = action_types_flat[action_idx:action_idx + num_actions]
+            
+            # Check if any building actions available
+            has_buildings = np.any(
+                (action_types == PLACE_SETTLEMENT) |
+                (action_types == PLACE_ROAD) |
+                (action_types == UPGRADE_CITY)
+            )
+            
+            # Apply heuristic adjustments
+            for i in range(num_actions):
+                action_type = action_types[i]
+                
+                if action_type == ENDTURN:
+                    # VERY strongly discourage EndTurn when buildings available
+                    adjusted[batch_idx, i] *= 0.001 if has_buildings else 0.05
+                elif action_type == PLACE_INITIAL_SETTLEMENT:
+                    # CRITICAL: Flatten initial settlement probabilities
+                    # This prevents agents from always picking first vertex (vertex 0, 1, 2, ...)
+                    # Give all initial settlements equal strong weight to encourage exploration
+                    adjusted[batch_idx, i] *= 1.0  # Keep uniform
+                elif action_type == PLACE_INITIAL_ROAD:
+                    # Initial roads: keep uniform (all adjacent roads equally valid)
+                    adjusted[batch_idx, i] *= 1.0
+                elif action_type in [PLACE_SETTLEMENT, PLACE_ROAD, UPGRADE_CITY]:
+                    # VERY strongly encourage building
+                    adjusted[batch_idx, i] *= 100.0
+                elif action_type in [BANK_TRADE, PORT_TRADE]:
+                    # Encourage trading
+                    adjusted[batch_idx, i] *= 5.0
+            
+            # Renormalize this state's policy
+            policy_sum = adjusted[batch_idx, :num_actions].sum()
+            if policy_sum > 0:
+                adjusted[batch_idx, :num_actions] /= policy_sum
+            else:
+                # Fallback to uniform if something went wrong
+                adjusted[batch_idx, :num_actions] = 1.0 / num_actions
+            
+            action_idx += num_actions
+        
+        return adjusted
     
     def play_games(
         self,

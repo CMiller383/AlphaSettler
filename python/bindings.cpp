@@ -222,6 +222,10 @@ PYBIND11_MODULE(catan_engine, m) {
             "Development cards remaining in deck")
         .def_readonly("resource_bank", &GameState::resource_bank,
             "Resources remaining in bank")
+        .def_readonly("setup_settlements_placed", &GameState::setup_settlements_placed,
+            "Setup phase: settlements placed by each player")
+        .def_readonly("setup_roads_placed", &GameState::setup_roads_placed,
+            "Setup phase: roads placed by each player")
         .def("is_game_over", &GameState::is_game_over)
         .def("get_winner", &GameState::get_winner)
         .def("is_vertex_occupied", &GameState::is_vertex_occupied)
@@ -484,6 +488,7 @@ PYBIND11_MODULE(catan_engine, m) {
             BatchEvaluatorCallback cpp_callback = [py_callback](
                 const std::vector<float>& stacked_states,
                 const std::vector<std::size_t>& num_legal_actions,
+                const std::vector<std::uint8_t>& action_types_flat,
                 std::size_t batch_size,
                 std::size_t feature_size
             ) -> std::vector<std::pair<std::vector<float>, float>> {
@@ -496,10 +501,18 @@ PYBIND11_MODULE(catan_engine, m) {
                     stacked_states.data()
                 );
                 
-                // Call Python callback
+                // Convert action types to numpy array (zero-copy)
+                py::array_t<std::uint8_t> action_types_array(
+                    {static_cast<py::ssize_t>(action_types_flat.size())},
+                    {sizeof(std::uint8_t)},
+                    action_types_flat.data()
+                );
+                
+                // Call Python callback with action types
                 py::object result = py_callback(
                     states_array,
                     num_legal_actions,
+                    action_types_array,
                     batch_size,
                     feature_size
                 );

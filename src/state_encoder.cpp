@@ -27,7 +27,7 @@ std::vector<float> StateEncoder::encode_state(
     ptr += StateEncoderConfig::NUM_EDGES * StateEncoderConfig::EDGE_FEATURES_PER;
     
     encode_players(state, perspective_player, ptr);
-    ptr += StateEncoderConfig::MAX_PLAYERS * StateEncoderConfig::PLAYER_FEATURES_PER;
+    ptr += StateEncoderConfig::PLAYER_FEATURES_TOTAL;
     
     encode_global(state, perspective_player, ptr);
     
@@ -139,36 +139,63 @@ void StateEncoder::encode_players(
         
         if (player_idx < state.num_players) {
             const PlayerState& player = state.players[player_idx];
+            bool is_self = (player_idx == perspective_player);
             
-            // Resources (normalized by max reasonable amount ~20)
-            for (std::size_t r = 0; r < StateEncoderConfig::NUM_RESOURCE_TYPES; ++r) {
-                *ptr++ = player.resources[r] / 20.0f;
+            if (is_self) {
+                // OWN PLAYER: Full information (like looking at your own hand)
+                
+                // Resources by type (normalized by max reasonable amount ~20)
+                for (std::size_t r = 0; r < StateEncoderConfig::NUM_RESOURCE_TYPES; ++r) {
+                    *ptr++ = player.resources[r] / 20.0f;
+                }
+                
+                // Dev cards by type (normalized by max in deck)
+                for (std::size_t d = 0; d < StateEncoderConfig::NUM_DEV_CARD_TYPES; ++d) {
+                    *ptr++ = player.dev_cards[d] / 5.0f;
+                }
+                
+                // Hidden VP (from dev cards - only you know this)
+                *ptr++ = player.hidden_victory_points / 10.0f;
+                
+            } else {
+                // OPPONENT: Limited information (only what you can see)
+                // OPTIMIZED: Only 9 features, no padding
+                
+                // Total resource count only (not by type)
+                std::uint8_t total_resources = 0;
+                for (std::size_t r = 0; r < StateEncoderConfig::NUM_RESOURCE_TYPES; ++r) {
+                    total_resources += player.resources[r];
+                }
+                *ptr++ = total_resources / 20.0f;
+                
+                // Total dev card count only (not by type)
+                std::uint8_t total_dev_cards = 0;
+                for (std::size_t d = 0; d < StateEncoderConfig::NUM_DEV_CARD_TYPES; ++d) {
+                    total_dev_cards += player.dev_cards[d];
+                }
+                *ptr++ = total_dev_cards / 5.0f;
             }
             
-            // Dev cards (normalized by max in deck)
-            for (std::size_t d = 0; d < StateEncoderConfig::NUM_DEV_CARD_TYPES; ++d) {
-                *ptr++ = player.dev_cards[d] / 5.0f;
-            }
+            // PUBLIC INFORMATION (visible to all players)
             
-            // Pieces remaining (normalized by starting amount)
+            // Pieces remaining (you can count these on the board)
             *ptr++ = player.settlements_remaining / 5.0f;
             *ptr++ = player.cities_remaining / 4.0f;
             *ptr++ = player.roads_remaining / 15.0f;
             
-            // Victory points (normalized by win condition)
+            // Public victory points only (settlements, cities, longest road, largest army)
             *ptr++ = player.public_victory_points / 10.0f;
-            *ptr++ = player.hidden_victory_points / 10.0f;
             
-            // Knights played (for largest army)
+            // Knights played (public info for largest army)
             *ptr++ = player.knights_played / 10.0f;
             
-            // Special achievements
+            // Special achievements (public)
             *ptr++ = player.has_longest_road ? 1.0f : 0.0f;
             *ptr++ = player.has_largest_army ? 1.0f : 0.0f;
         } else {
-            // Padding for games with <4 players
-            std::memset(ptr, 0, StateEncoderConfig::PLAYER_FEATURES_PER * sizeof(float));
-            ptr += StateEncoderConfig::PLAYER_FEATURES_PER;
+            // Padding for games with <4 players (use opponent size)
+            std::memset(ptr, 0, StateEncoderConfig::OPPONENT_PLAYER_FEATURES * sizeof(float));
+            ptr += StateEncoderConfig::OPPONENT_PLAYER_FEATURES;
         }
     }
 }

@@ -92,10 +92,10 @@ class QuickTestConfig(TrainingConfig):
         # MCTS settings
         self.mcts_simulations = 100
         
-        # 1000 games: 10 iterations × 100 games
-        self.games_per_iteration = 100
+        # Test: 5 iterations × 20 games = 100 total games
+        self.games_per_iteration = 20
         self.training_epochs_per_iteration = 3
-        self.num_iterations = 10
+        self.num_iterations = 5
         
         # Training settings
         self.batch_size = 128
@@ -103,7 +103,7 @@ class QuickTestConfig(TrainingConfig):
         
         # Checkpointing
         self.checkpoint_interval = 10  # Save every 10 iterations
-        self.eval_interval = 5
+        self.eval_interval = 25
         self.eval_games = 20
         
         # Performance settings optimized for H100 with 16 cores
@@ -227,7 +227,7 @@ class H100Config(PACEGPUConfig):
         self.mcts_simulations = 200
         
         # 100 games per iteration × 100 iterations = 10,000 games
-        self.games_per_iteration = 100
+        self.games_per_iteration = 50
         self.training_epochs_per_iteration = 5
         self.num_iterations = 100
         

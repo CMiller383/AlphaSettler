@@ -12,6 +12,25 @@
 namespace catan {
 namespace alphazero {
 
+namespace {
+    // Convert value from one player's perspective to another's in multi-player game
+    // For 4-player Catan, this is complex because it's not zero-sum
+    // We use a position-based heuristic: opponent values are negatively correlated
+    inline float convert_value_perspective(float value, std::uint8_t from_player, std::uint8_t to_player, std::uint8_t num_players) {
+        if (from_player == to_player) {
+            return value;  // Same player, no conversion needed
+        }
+        
+        // In multi-player games, we approximate opponent perspective
+        // Key insight: if it's good for them, it's likely bad for us
+        // Use a weighted negation based on number of players
+        // For 4 players: value is divided among opponents
+        // If player A has value +0.8, each opponent has roughly -0.8/3 ≈ -0.27
+        float opponent_factor = -1.0f / static_cast<float>(num_players - 1);
+        return value * opponent_factor;
+    }
+}
+
 Action AlphaZeroMCTS::search(const GameState& root_state) {
     // Create root node
     root_ = std::make_unique<AlphaZeroNode>();
@@ -207,20 +226,12 @@ void AlphaZeroMCTS::expand_and_evaluate(AlphaZeroNode* node, GameState& state) {
         return;
     }
     
-    // Already expanded (has children) - just evaluate
+    // CRITICAL FIX: Node should NEVER have children here!
+    // If selection is working correctly, we only reach unexpanded leaves.
+    // Re-evaluating already-expanded nodes is a bug that causes shallow search.
     if (!node->children.empty()) {
-        NNEvaluation eval = evaluator_(state);
-        float value = eval.value;
-        
-        // Convert value to root player's perspective
-        // NN outputs value from current player's perspective
-        if (state.current_player != node->root_player_idx) {
-            // In multi-player, we can't just negate
-            // Use a simple heuristic: if not our turn, value is less reliable
-            // For now, keep as-is (assumes NN learns multi-player dynamics)
-        }
-        
-        node->value_sum += value;
+        // This should never happen - log error and handle gracefully
+        // Just increment visit count and return (value already set from previous expansion)
         node->visit_count++;
         return;
     }
@@ -272,8 +283,8 @@ void AlphaZeroMCTS::expand_and_evaluate(AlphaZeroNode* node, GameState& state) {
         node->children.push_back(std::move(child));
     }
     
-    // Update node with NN value
-    float value = eval.value;
+    // Update node with NN value (convert to root player's perspective)
+    float value = convert_value_perspective(eval.value, state.current_player, node->root_player_idx, state.num_players);
     node->value_sum += value;
     node->visit_count++;
 }
@@ -353,7 +364,7 @@ void AlphaZeroMCTS::apply_evaluation(AlphaZeroNode* node, const NNEvaluation& ev
     
     // If already expanded, just update value
     if (!node->children.empty()) {
-        float value = eval.value;
+        float value = convert_value_perspective(eval.value, state.current_player, node->root_player_idx, state.num_players);
         node->value_sum += value;
         node->visit_count++;
         return;
@@ -392,8 +403,8 @@ void AlphaZeroMCTS::apply_evaluation(AlphaZeroNode* node, const NNEvaluation& ev
         node->children.push_back(std::move(child));
     }
     
-    // Update node with NN value
-    float value = eval.value;
+    // Update node with NN value (convert to root player's perspective)
+    float value = convert_value_perspective(eval.value, state.current_player, node->root_player_idx, state.num_players);
     node->value_sum += value;
     node->visit_count++;
 }

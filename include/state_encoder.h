@@ -27,7 +27,11 @@ struct StateEncoderConfig {
     static constexpr std::size_t TILE_FEATURES_PER = 8;      // resource(6) + number(1) + robber(1)
     static constexpr std::size_t VERTEX_FEATURES_PER = 9;    // piece_type(3) + owner(5) + harbor(1)
     static constexpr std::size_t EDGE_FEATURES_PER = 5;      // occupied(1) + owner(4)
-    static constexpr std::size_t PLAYER_FEATURES_PER = 17;   // resources(5) + dev_cards(5) + pieces(3) + VP(2) + achievements(2)
+    // IMPORTANT: Self player and opponents have DIFFERENT feature counts!
+    // Self: 18 features (full info), Opponents: 9 features each (public info only)
+    static constexpr std::size_t SELF_PLAYER_FEATURES = 18;
+    static constexpr std::size_t OPPONENT_PLAYER_FEATURES = 9;
+    static constexpr std::size_t PLAYER_FEATURES_TOTAL = SELF_PLAYER_FEATURES + (MAX_PLAYERS - 1) * OPPONENT_PLAYER_FEATURES;
     static constexpr std::size_t GLOBAL_FEATURES = 20;       // current_player(4) + phases(6) + turn(1) + achievements(8) + num_players(1)
     
     // Total feature count
@@ -35,7 +39,7 @@ struct StateEncoderConfig {
         (NUM_TILES * TILE_FEATURES_PER) +
         (NUM_VERTICES * VERTEX_FEATURES_PER) +
         (NUM_EDGES * EDGE_FEATURES_PER) +
-        (MAX_PLAYERS * PLAYER_FEATURES_PER) +
+        PLAYER_FEATURES_TOTAL +
         GLOBAL_FEATURES;
 };
 
