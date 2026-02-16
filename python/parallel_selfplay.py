@@ -64,6 +64,16 @@ class ParallelSelfPlayEngine:
         # State encoder for converting states to features
         self.encoder = StateEncoder()
         
+        # VP heuristic blending weight (set by trainer each iteration)
+        # When > 0, blends NN value with VP-based heuristic to bootstrap
+        # untrained networks with real signal
+        self.heuristic_value_weight = 0.0
+        
+        # VP feature offset in encoded state vector (for extracting VP from features)
+        # Layout: tiles(19*8) + vertices(54*9) + edges(72*5) + self_player(resources5+devs5+hidden_vp1+sett1+city1+road1+PUBLIC_VP)
+        self._VP_FEATURE_OFFSET = 19*8 + 54*9 + 72*5 + 5 + 5 + 1 + 1 + 1 + 1  # = 1012
+        self._HIDDEN_VP_OFFSET = 19*8 + 54*9 + 72*5 + 5 + 5  # = 1008
+        
         # Statistics
         self.stats = defaultdict(float)
         self.stats_lock = threading.Lock()
@@ -119,6 +129,17 @@ class ParallelSelfPlayEngine:
             num_actions_list, 
             action_types_flat
         )
+        
+        # Blend NN value with VP heuristic for bootstrapping
+        w = self.heuristic_value_weight
+        if w > 0:
+            for i in range(batch_size):
+                # Extract VP from encoded features at known offsets
+                # public_vp / 10.0 is at VP_FEATURE_OFFSET, hidden_vp / 10.0 at HIDDEN_VP_OFFSET
+                public_vp_norm = states_np[i, self._VP_FEATURE_OFFSET]   # already /10
+                hidden_vp_norm = states_np[i, self._HIDDEN_VP_OFFSET]    # already /10
+                heuristic_value = min(public_vp_norm + hidden_vp_norm, 1.0)
+                values_np[i] = (1.0 - w) * values_np[i] + w * heuristic_value
         
         # OPTIMIZATION: Minimize per-state operations
         results = []
@@ -328,13 +349,14 @@ class ParallelSelfPlayEngine:
         nn_evaluator = make_batched_nn_evaluator(self.batched_evaluator)
         mcts = AlphaZeroMCTS(self.mcts_config, nn_evaluator, self.batched_evaluator)
         
-        # Game data for training
-        states = []
-        actions = []
-        policies = []
+        # Game data for training — encode features NOW, not later
+        # CRITICAL: We must encode at the time of generation because
+        # apply_action mutates state in-place. Storing state references
+        # would result in all entries pointing to the same final state.
+        training_data = []
         
         turn_count = 0
-        max_turns = 500
+        max_turns = 2000  
         
         while not state.is_game_over() and turn_count < max_turns:
             # Get legal actions
@@ -342,27 +364,43 @@ class ParallelSelfPlayEngine:
             if not legal_actions:
                 break
             
+            # Capture current state info BEFORE mutation
+            player = state.current_player
+            features = np.array(
+                self.encoder.encode_state(state, player), dtype=np.float32
+            )
+            num_legal = len(legal_actions)
+            
             # Run MCTS
             selected_action = mcts.search(state)
             action_probs = mcts.get_action_probabilities()
             
-            # Store training data
-            states.append(state)
-            actions.append(selected_action)
-            policies.append(action_probs)
+            # Store pre-encoded training data
+            training_data.append({
+                'features': features,
+                'player': player,
+                'policy': np.array(action_probs[:num_legal], dtype=np.float32),
+                'legal_indices': np.arange(num_legal, dtype=np.int32),
+            })
             
-            # Apply action
+            # Apply action (mutates state in-place)
             apply_action(state, selected_action, np.random.randint(0, 1_000_000))
             turn_count += 1
         
         winner = state.get_winner() if state.is_game_over() else None
         
+        # For incomplete games, capture final VP for proxy values
+        final_vps = None
+        if winner is None and state.num_players > 0:
+            final_vps = []
+            for p in range(state.num_players):
+                final_vps.append(state.players[p].total_victory_points())
+        
         return {
-            'states': states,
-            'actions': actions,
-            'policies': policies,
+            'training_data': training_data,
             'winner': winner,
             'turns': turn_count,
+            'final_vps': final_vps,
             'seed': seed,
             'worker_id': worker_id,
         }

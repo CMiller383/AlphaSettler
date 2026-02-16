@@ -62,8 +62,9 @@ class AlphaZeroAgent:
         batch_config.timeout_ms = 10
         batch_config.enable_batching = True
         
-        def batch_callback(stacked_states_flat, num_legal_actions, batch_size, feature_size):
-            """Optimized batch callback with pre-stacked arrays."""
+        def batch_callback(stacked_states_flat, num_legal_actions, action_types_flat, batch_size, feature_size):
+            """Optimized batch callback with pre-stacked arrays.
+            Signature must match C++ BatchedEvaluator: (states, num_actions, action_types, batch, features)."""
             if batch_size == 0:
                 return []
             
@@ -120,7 +121,7 @@ class AlphaZeroAgent:
     
     @classmethod
     def from_checkpoint(cls, checkpoint_path, mcts_simulations=100, device='cuda', 
-                       add_noise=False):
+                       add_noise=False, hidden_size=128, num_residual_blocks=2):
         """
         Create AlphaZero agent from saved checkpoint.
         
@@ -129,19 +130,21 @@ class AlphaZeroAgent:
             mcts_simulations: Number of MCTS simulations per move
             device: 'cuda' or 'cpu'
             add_noise: Add exploration noise (for training)
+            hidden_size: Network hidden layer size (must match checkpoint)
+            num_residual_blocks: Number of residual blocks (must match checkpoint)
             
         Returns:
             AlphaZeroAgent instance
         """
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Create network
         encoder = StateEncoder()
         network = CatanNetwork(
             input_size=encoder.get_feature_size(),
-            hidden_size=256,
-            num_residual_blocks=3
+            hidden_size=hidden_size,
+            num_residual_blocks=num_residual_blocks
         ).to(device)
         
         network.load_state_dict(checkpoint['network_state'])

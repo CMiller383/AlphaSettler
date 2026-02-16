@@ -3,6 +3,14 @@ AlphaZero training loop for Catan.
 Self-play → collect training data → train network → evaluate → repeat.
 """
 
+import os
+import sys
+
+# Ensure project root is on sys.path so we find the working catan_engine .pyd
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -22,34 +30,11 @@ from catan_engine import (
 )
 from state_encoder import StateEncoder
 from catan_network import CatanNetwork
-from config import (
-    TrainingConfig, QuickTestConfig, SmallTrainingConfig, 
-    MediumTrainingConfig, LargeTrainingConfig, 
-    PACEGPUConfig, H100Config, H200Config
-)
+from config import TrainingConfig
 from parallel_selfplay import ParallelSelfPlayEngine
 
 
-# ============================================================================
-# TRAINING CONFIGURATION - CHANGE THIS TO SELECT DIFFERENT CONFIGS
-# ============================================================================
-
-# Uncomment ONE of the following configurations:
-
-# TRAINING_CONFIG = QuickTestConfig()      # 15 games - quick test (5-10 min)
-# TRAINING_CONFIG = SmallTrainingConfig()   # 500 games - initial training (~2-4 hours)
-# TRAINING_CONFIG = MediumTrainingConfig()  # 10k games - serious training (~10-20 hours)
-# TRAINING_CONFIG = LargeTrainingConfig()   # 100k games - full training (~100+ hours CPU)
-
-# For PACE GPU Cluster:
-# TRAINING_CONFIG = PACEGPUConfig()        # A100 optimized (100k games, ~40-80 hours)
-# TRAINING_CONFIG = H100Config()           # H100 optimized (ready for full training)
-# TRAINING_CONFIG = H200Config()           # H200 optimized (100k games, ~20-40 hours)
-
-# For testing:
-TRAINING_CONFIG = QuickTestConfig()      # 1000 games benchmark test
-
-# ============================================================================
+TRAINING_CONFIG = TrainingConfig()
 
 
 class AlphaZeroTrainer:
@@ -89,6 +74,9 @@ class AlphaZeroTrainer:
         
         # Replay buffer
         self.replay_buffer = deque(maxlen=config.replay_buffer_size)
+        
+        # VP heuristic blending weight for bootstrapping untrained NN
+        self.heuristic_value_weight = config.heuristic_value_weight
         
         # Statistics
         self.training_step = 0
@@ -132,6 +120,14 @@ class AlphaZeroTrainer:
         # HEURISTIC FIX: Adjust policy to encourage building, discourage EndTurn
         # This helps early training when network outputs are nearly uniform
         policy_probs = self._adjust_policy_heuristic(policy_probs, legal_actions)
+        
+        # Blend NN value with VP heuristic for bootstrapping
+        # This gives MCTS real value signal when the NN is untrained (outputs ~0)
+        w = self.heuristic_value_weight
+        if w > 0:
+            vp = state.players[player].total_victory_points()
+            heuristic_value = min(vp / 10.0, 1.0)
+            value = (1.0 - w) * value + w * heuristic_value
         
         # Create result
         result = NNEvaluation()
@@ -194,7 +190,7 @@ class AlphaZeroTrainer:
         
         # Play until game over
         turn_count = 0
-        max_turns = 500
+        max_turns = 2000  # Fixed: Catan needs 600-1500 actions to complete
         
         while not state.is_game_over() and turn_count < max_turns:
             player = state.current_player
@@ -292,6 +288,10 @@ class AlphaZeroTrainer:
             device=self.config.device
         )
         
+        # Pass the current heuristic value weight so the batched evaluator
+        # blends NN value with VP heuristic during MCTS search
+        engine.heuristic_value_weight = self.heuristic_value_weight
+        
         # Run parallel self-play
         results = engine.play_games(
             num_games=num_games,
@@ -309,50 +309,36 @@ class AlphaZeroTrainer:
         print(f"  Avg turns/game: {avg_turns:.1f}")
         
         for game_result in results:
-            # Convert each game to training examples
-            states = game_result['states']
-            policies = game_result['policies']
+            # Consume pre-encoded training data (features encoded at generation time)
+            training_data = game_result['training_data']
             winner = game_result['winner']
+            final_vps = game_result.get('final_vps')
             
-            # CRITICAL FIX: Only train on completed games!
-            # Training on incomplete games teaches the network that stuck states are normal
-            if winner is None:
-                # Game didn't finish - discard these examples
-                self.self_play_games += 1
-                continue
-            
-            for i, (state, policy) in enumerate(zip(states, policies)):
-                player = state.current_player
+            for example in training_data:
+                features = example['features']
                 
-                # Encode state
-                features = self.encoder.encode_state(state, player)
-                
-                # Convert to numpy array immediately to ensure proper type
-                features = np.array(features, dtype=np.float32)
-                
-                # Sanity check for NaN/Inf during encoding
+                # Sanity check for NaN/Inf
                 if np.any(np.isnan(features)) or np.any(np.isinf(features)):
-                    print(f"WARNING: NaN/Inf detected during state encoding at game {i}!")
-                    print(f"  Player: {player}, Turn: {state.turn_number}")
-                    continue  # Skip this corrupted example
+                    continue
                 
-                # Get legal actions for this state
-                legal_actions = generate_legal_actions(state)
-                num_legal = len(legal_actions)
-                
-                # Policy is already in correct format from MCTS
-                policy_arr = np.array(policy[:num_legal], dtype=np.float32)
-                legal_indices = np.arange(num_legal, dtype=np.int32)
-                
-                # Value: 1 for winner, 0 for losers (only completed games reach here)
-                value = 1.0 if player == winner else 0.0
+                # Assign value based on game outcome
+                if winner is not None:
+                    # Completed game: clear win/loss signal
+                    value = 1.0 if example['player'] == winner else 0.0
+                else:
+                    # Incomplete game: use VP as proxy value instead of discarding
+                    # These examples are less valuable but still provide signal
+                    if final_vps is not None:
+                        value = final_vps[example['player']] / 10.0
+                    else:
+                        value = 0.0
                 
                 # Add to replay buffer
                 self.replay_buffer.append({
                     'state': features,
-                    'policy': policy_arr,
-                    'legal_indices': legal_indices,
-                    'player': player,
+                    'policy': example['policy'],
+                    'legal_indices': example['legal_indices'],
+                    'player': example['player'],
                     'value': value
                 })
                 total_examples += 1
@@ -493,7 +479,9 @@ class AlphaZeroTrainer:
             'training_step': self.training_step,
             'self_play_games': self.self_play_games,
             'replay_buffer': list(self.replay_buffer),
-            'training_history': self.training_history
+            'training_history': self.training_history,
+            'hidden_size': self.config.hidden_size,
+            'num_residual_blocks': self.config.num_residual_blocks,
         }
         torch.save(checkpoint, path)
         print(f"Saved checkpoint to {path}")
@@ -605,29 +593,9 @@ class AlphaZeroTrainer:
 
 def main():
     """Example training run."""
-    # Allow config selection via environment variable
+    # Use config from environment variable or default
     config_name = os.environ.get('ALPHASETTLER_CONFIG', 'TRAINING_CONFIG')
-    
-    # Map config names to actual config objects
-    config_map = {
-        'QuickTestConfig': QuickTestConfig(),
-        'SmallTrainingConfig': SmallTrainingConfig(),
-        'MediumTrainingConfig': MediumTrainingConfig(),
-        'LargeTrainingConfig': LargeTrainingConfig(),
-        'PACEGPUConfig': PACEGPUConfig(),
-        'H100Config': H100Config(),
-        'H200Config': H200Config(),
-        'TRAINING_CONFIG': TRAINING_CONFIG  # Default from top of file
-    }
-    
-    # Select config
-    if config_name in config_map:
-        config = config_map[config_name]
-        if config_name != 'TRAINING_CONFIG':
-            print(f"Using config from environment: {config_name}\n")
-    else:
-        print(f"Warning: Unknown config '{config_name}', using default TRAINING_CONFIG\n")
-        config = TRAINING_CONFIG
+    config = TRAINING_CONFIG
     
     # Create run directory with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -661,11 +629,25 @@ def main():
     print(f"  Batch size: {config.max_batch_size}")
     print(f"{'='*90}\n")
     
+    # Heuristic decay schedule
+    decay_iters = config.heuristic_decay_iterations or config.num_iterations
+    initial_weight = config.heuristic_value_weight
+    
     # Training loop
     for iteration in range(config.num_iterations):
         iter_start = time.time()
+        
+        # Decay heuristic value weight linearly over training
+        # Starts at initial_weight, reaches 0 at decay_iters
+        if decay_iters > 0:
+            trainer.heuristic_value_weight = max(
+                0.0, initial_weight * (1.0 - iteration / decay_iters)
+            )
+        else:
+            trainer.heuristic_value_weight = 0.0
+        
         print(f"\n{'─'*90}")
-        print(f"  Iteration {iteration + 1}/{config.num_iterations}")
+        print(f"  Iteration {iteration + 1}/{config.num_iterations}  (heuristic_weight={trainer.heuristic_value_weight:.2f})")
         print(f"{'─'*90}")
         
         # Self-play
