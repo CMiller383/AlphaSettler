@@ -1,121 +1,97 @@
 # AlphaSettler
 
-**AlphaZero-style deep reinforcement learning for Settlers of Catan**
+AlphaZero-style reinforcement learning for Catan, built on a custom C++17 engine with Python training and evaluation tooling.
 
-Fast C++ game engine with batched GPU evaluation, parallel self-play, and neural network training.
+This repo is a full-stack RL project: game rules engine, move generation, search, neural network inference, parallel self-play, training, and evaluation.
+
+## What I Built
+
+- A full Catan rules engine in C++ (`game_state`, transitions, legal move generation, scoring, dev cards, robber, trading, setup flow)
+- A compact action system (`Action` is 8 bytes) and copy-friendly game state designed for search speed
+- Two search stacks:
+  - Pure MCTS with rollouts
+  - AlphaZero MCTS (PUCT + policy/value guidance + Dirichlet root noise + virtual loss)
+- A pybind11 bridge (`python/bindings.cpp`) so the C++ engine runs directly from Python
+- A batched NN evaluator and multithreaded self-play pipeline for higher throughput
+- A residual policy/value network in PyTorch (`python/catan_network.py`)
+- End-to-end training + checkpointing + evaluation tooling
+
+## Engineering Highlights
+
+- **Rule-complete action generation:** Setup placements, roads/settlements/cities, dev cards, robber actions, discards, bank and port trades
+- **Perspective-aware state encoding:** C++ encoder exposes hidden info for self and public info for opponents
+- **Parallelism where it matters:** Multiple self-play workers share one batched evaluator
+- **Search quality controls:** PUCT exploration, root noise, and visit-count policies for training targets
+- **Practical training pipeline:** Replay buffer, policy+value losses, checkpoint cadence, metrics logging, training curves
+
+## Recent Improvements
+
+
+- Fixed a critical parallel self-play data bug (state references were mutating in-place)
+- Raised action cap for realistic game completion (2000 actions)
+- Added value bootstrapping (NN value blended with VP heuristic early in training)
+- Kept incomplete-game examples by assigning VP-proxy values instead of discarding data
 
 ## Quick Start
 
-### 1. Build
-```bash
-# Install dependencies
-pip install torch numpy tqdm
+### 1. Install + build
 
-# Build C++ engine
+```bash
+pip install -r requirements.txt
 python setup.py build_ext --inplace
 ```
 
-### 2. Test
+### 2. Run an evaluation matchup
+
 ```bash
-# Complete end-to-end test
-python test_complete.py
+python python/eval_agents.py --games 20 --iterations 100 --mode mcts_vs_random
 ```
 
-### 3. Train
+### 3. (Optional) Run training
+
 ```bash
-# Local training
 python python/train_alphazero.py
-
-# Edit python/config.py to choose:
-# - QuickTestConfig (3 iter, 15 games)
-# - SmallTrainingConfig (20 iter, 1K games)
-# - MediumTrainingConfig (100 iter, 10K games)
-# - H100Config / H200Config (GPU optimized)
 ```
 
-### 4. Deploy to PACE/ICE
+## C++ Test Binaries
+
 ```bash
-# Copy files
-scp -r AlphaSettler <username>@login-ice.pace.gatech.edu:~/
-
-# SSH and setup
-ssh <username>@login-ice.pace.gatech.edu
-cd ~/AlphaSettler
-chmod +x deploy_pace.sh
-./deploy_pace.sh
-
-# Submit training job
-sbatch run_training.sh
+cmake -S . -B build
+cmake --build build
 ```
 
-## Features
+Built test executables include:
 
-- **C++ Game Engine**: Efficient board state and move generation
-- **AlphaZero MCTS**: Neural network-guided tree search
-- **Batched Evaluation**: 2-5x speedup via batch NN inference
-- **Parallel Self-Play**: Multi-threaded game generation
-- **GPU Training**: PyTorch with automatic H100/H200 detection
-- **Progress Monitoring**: Real-time progress bars and metrics
+- `test_game_state`
+- `test_move_gen`
+- `test_state_transition`
+- `test_mcts`
+- `test_mcts_agent`
+- `test_visualize_grid`
 
-## Training Configs
+## Project Layout
 
-| Config | Iterations | Games | Time (H100) |
-|--------|-----------|--------|-------------|
-| QuickTest | 3 | 15 | ~1 min |
-| Small | 20 | 1K | ~10 min |
-| Medium | 100 | 10K | ~1 hour |
-| H100 | 2000 | 2M | ~2-5 days |
-| H200 | 3000 | 4.5M | ~3-7 days |
-
-## Output
-
-Training produces:
-```
-training_runs/YYYYMMDD_HHMMSS/
-├── training_log.json       # All metrics
-├── run_info.json          # Config info
-├── training_curves.png    # Loss plots
-└── checkpoints/
-    ├── checkpoint_iter_100.pt
-    └── final_model.pt
-```
-
-## Project Structure
-
-```
+```text
 AlphaSettler/
-├── include/              # C++ headers
-│   ├── action.h
-│   ├── game_state.h
-│   ├── move_gen.h
-│   └── mcts/            # MCTS headers
-├── src/                 # C++ implementation
-│   ├── game_state.cpp
-│   ├── move_gen.cpp
-│   └── mcts/
-├── python/
-│   ├── train_alphazero.py      # Main training loop
-│   ├── parallel_selfplay.py    # Multi-threaded self-play
-│   ├── catan_network.py        # Neural network
-│   ├── config.py              # Training configs
-│   └── bindings.cpp           # Python/C++ interface
-├── test_complete.py     # End-to-end test
-├── deploy_pace.sh      # PACE setup script
-└── run_training.sh     # SLURM job script
+|-- include/              # C++ headers (engine, rules, search, encoder)
+|-- src/                  # C++ implementation
+|   `-- mcts/             # MCTS + AlphaZero MCTS
+|-- python/
+|   |-- bindings.cpp      # pybind11 bridge to C++
+|   |-- catan_network.py  # PyTorch policy/value network
+|   |-- parallel_selfplay.py
+|   |-- train_alphazero.py
+|   |-- eval_agents.py
+|   `-- eval_alphazero.py
+|-- tests/                # C++ test programs
+|-- _eval_checkpoints.py
+|-- CMakeLists.txt
+`-- setup.py
 ```
 
-## Performance
+## Tech Stack
 
-- **Local (CPU, 8 cores)**: ~2-5 games/sec
-- **H100 GPU**: ~15-30 games/sec (32 workers, batch 128)
-- **H200 GPU**: ~20-40 games/sec (48 workers, batch 192)
-- **Batch efficiency**: 2.0-5.0 avg batch size
-
-## Requirements
-
-- **C++17** compiler (GCC 9+, MSVC 2019+)
-- **Python 3.11+**
-- **PyTorch** with CUDA 12.1+ (for GPU)
-- **pybind11**, **numpy**, **tqdm**
-
-
+- C++17 (engine + search)
+- pybind11 (bindings)
+- Python + PyTorch (training/inference)
+- NumPy + tqdm + matplotlib (data and instrumentation)
